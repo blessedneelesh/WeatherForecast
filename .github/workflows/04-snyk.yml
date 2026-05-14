@@ -1,0 +1,195 @@
+﻿# =============================================================
+# PHASE 4 — Snyk Security Scanning
+# Trigger : push → main/develop, pull_request → main
+# Goal    : Scan NuGet dependencies + Docker image for CVEs
+# Tools   : Snyk CLI, snyk/actions
+#
+# REQUIRED SECRETS:
+#   SNYK_TOKEN  → from https://app.snyk.io/account (API token)
+#
+# HOW TO GET YOUR SNYK_TOKEN:
+#   1. Sign up at https://app.snyk.io (free tier available)
+#   2. Go to Account Settings → API Token
+#   3. Copy the token → add as repo secret SNYK_TOKEN
+# =============================================================
+
+name: "🛡️ Phase 4 — Snyk Security"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+  # Weekly scan to catch newly published CVEs
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  DOTNET_NOLOGO: true
+
+jobs:
+  # -----------------------------------------------------------
+  # JOB 1: Snyk — NuGet dependency vulnerability scan
+  # Scans all .csproj files for known vulnerable packages
+  # -----------------------------------------------------------
+  snyk-dependencies:
+    name: "Snyk — NuGet Dependencies"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write    # Upload SARIF to Security tab
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # Run Snyk dependency scan
+      # --severity-threshold=high → only fail on HIGH and CRITICAL
+      # --sarif-file-output      → upload to GitHub Security tab
+      - name: Snyk dependency test
+        uses: snyk/actions/dotnet@master
+        continue-on-error: true    # Don't block — upload results first
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >
+            --severity-threshold=high
+            --sarif-file-output=snyk-deps.sarif
+            --all-projects
+            --detection-depth=4
+
+      - name: Upload Snyk dependency SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-dotnet-dependencies
+
+      # Post a summary
+      - name: Snyk dependency summary
+        if: always()
+        run: |
+          echo "## 🛡️ Snyk — NuGet Dependency Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Results uploaded to the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Snyk monitors: [app.snyk.io](https://app.snyk.io)" >> $GITHUB_STEP_SUMMARY
+
+  # -----------------------------------------------------------
+  # JOB 2: Snyk — Docker image vulnerability scan
+  # Builds the image locally and scans OS + runtime layers
+  # -----------------------------------------------------------
+  snyk-container:
+    name: "Snyk — Docker Image Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: snyk-dependencies    # Run after dep scan
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Build the Docker image locally (do not push — scan first)
+      - name: Build Docker image for scanning
+        run: |
+          docker build \
+            --tag globoticket-api:snyk-scan \
+            --file Dockerfile \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            .
+
+      # Scan the container image with Snyk
+      # --file=Dockerfile → gives Snyk base image context
+      - name: Snyk container test
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: globoticket-api:snyk-scan
+          args: >
+            --file=Dockerfile
+            --severity-threshold=high
+            --sarif-file-output=snyk-container.sarif
+            --exclude-base-image-vulns
+
+      - name: Upload Snyk container SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container-image
+
+      - name: Snyk container summary
+        if: always()
+        run: |
+          echo "## 🐳 Snyk — Docker Image Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`globoticket-api:snyk-scan\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity threshold | HIGH + CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Results | [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) |" >> $GITHUB_STEP_SUMMARY
+
+  # -----------------------------------------------------------
+  # JOB 3: Snyk — IaC scan (Dockerfile, K8s manifests)
+  # -----------------------------------------------------------
+  snyk-iac:
+    name: "Snyk — Infrastructure as Code"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: snyk-dependencies
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Snyk IaC scan
+        uses: snyk/actions/iac@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >
+            --sarif-file-output=snyk-iac.sarif
+            --severity-threshold=medium
+
+      - name: Upload Snyk IaC SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-iac.sarif
+          category: snyk-iac
