@@ -81,24 +81,18 @@ jobs:
             --all-projects
             --detection-depth=4
 
-      # Check if SARIF file exists and has content
+      # Check if SARIF file exists
       - name: Verify SARIF file
         id: verify-sarif
         run: |
           if [ -f "snyk-deps.sarif" ]; then
-            echo "SARIF file found"
+            echo "✅ SARIF file found"
             echo "has_sarif=true" >> $GITHUB_OUTPUT
             
-            # Check if file has multiple runs (which causes the error)
-            run_count=$(jq '.runs | length' snyk-deps.sarif 2>/dev/null || echo "0")
-            echo "Number of runs in SARIF: $run_count"
-            
-            if [ "$run_count" -gt 1 ]; then
-              echo "⚠️ Multiple runs detected. Splitting SARIF file..."
-              echo "needs_split=true" >> $GITHUB_OUTPUT
-            else
-              echo "needs_split=false" >> $GITHUB_OUTPUT
-            fi
+            # Show file info for debugging
+            ls -lh snyk-deps.sarif
+            echo "First 20 lines:"
+            head -n 20 snyk-deps.sarif  
           else
             echo "No SARIF file found"
             echo "has_sarif=false" >> $GITHUB_OUTPUT
