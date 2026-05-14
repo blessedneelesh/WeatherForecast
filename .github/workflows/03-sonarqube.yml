@@ -19,11 +19,11 @@ name: "🔍 Phase 3 — SonarQube Analysis"
 on:
   push:
     branches:
-      - main
+      - master
       - develop
   pull_request:
     branches:
-      - main
+      - master
       - develop
     types: [opened, synchronize, reopened]
 
