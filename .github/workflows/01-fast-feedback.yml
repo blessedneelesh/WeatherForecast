@@ -1,0 +1,78 @@
+﻿# =============================================================
+# PHASE 1 — Fast Feedback CI
+# Trigger : push to any feature/* branch
+# Goal    : Fail-fast compile check in ~30 seconds
+# Tools   : .NET 8 SDK, NuGet cache
+# =============================================================
+
+name: "⚡ Phase 1 — Fast Feedback"
+
+on:
+  push:
+    branches:
+      - "feature/**"
+      - "fix/**"
+      - "hotfix/**"
+      - "users/**"
+env:
+  DOTNET_VERSION: "8.0.x"
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  # -----------------------------------------------------------
+  # JOB: compile
+  # Restores NuGet packages and builds in Release mode.
+  # No tests — this is a sub-60-second compile gate only.
+  # -----------------------------------------------------------
+  compile:
+    name: "Compile Check (.NET 8)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # 1. Checkout source code
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed for SonarQube blame data in later phases
+
+      # 2. Install .NET 8 SDK
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # 3. Restore NuGet packages from cache (10-15× faster)
+      #    Cache key: OS + all *.csproj file hashes
+      #    If any .csproj changes → cache miss → fresh restore
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore --locked-mode
+        # --locked-mode ensures packages.lock.json is respected
+        # Remove --locked-mode if you haven't generated lock files yet
+
+      # 4. Compile only — no tests, no publish
+      - name: Build (Release)
+        run: |
+          dotnet build \
+            --no-restore \
+            --configuration Release \
+            -p:TreatWarningsAsErrors=false \
+            -p:Nullable=enable
+
+      # 5. Annotate the PR/commit with any build warnings
+      - name: Annotate build output
+        if: failure()
+        run: |
+          echo "::error::Build failed. Check the output above for compiler errors."
+          echo "## ❌ Build Failed" >> $GITHUB_STEP_SUMMARY
+          echo "The project failed to compile on branch \`${{ github.ref_name }}\`." >> $GITHUB_STEP_SUMMARY
+          echo "Fix compilation errors before opening a Pull Request." >> $GITHUB_STEP_SUMMARY
