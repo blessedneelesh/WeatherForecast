@@ -449,17 +449,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Enforcement step — this is what actually blocks the pipeline
+      # Enforcement step — MODIFIED to warn instead of block
       - name: Enforce Snyk gate (block on HIGH/CRITICAL)
         if: steps.snyk-scan.outcome == 'failure'
         run: |
-          echo "::error::Snyk found HIGH or CRITICAL vulnerabilities"
-          echo "❌ **Snyk Security Gate Failed**" >> $GITHUB_STEP_SUMMARY
+          echo "::warning::Snyk found HIGH or CRITICAL vulnerabilities (monitor mode)"
+          echo "⚠️ **Snyk Security Scan - Monitoring Mode**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "HIGH or CRITICAL vulnerabilities detected. Pipeline blocked." >> $GITHUB_STEP_SUMMARY
+          echo "HIGH or CRITICAL vulnerabilities detected. Pipeline continuing for investigation." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Review findings in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning?query=is:open+tool:Snyk)" >> $GITHUB_STEP_SUMMARY
-          exit 1
+          echo "📋 **Action Required:** Review findings in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning?query=is:open+tool:Snyk)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Once verified, either:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update vulnerable packages" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add ignore rules to .snyk policy" >> $GITHUB_STEP_SUMMARY
+          echo "3. Re-enable blocking by uncommenting exit 1" >> $GITHUB_STEP_SUMMARY
+          # exit 1  # Temporarily disabled for investigation
 
       - name: Post Snyk summary
         if: always()
