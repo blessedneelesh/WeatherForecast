@@ -18,11 +18,11 @@ name: "🛡️ Phase 4 — Snyk Security"
 on:
   push:
     branches:
-      - main
+      - master
       - develop
   pull_request:
     branches:
-      - main
+      - master
   # Weekly scan to catch newly published CVEs
   schedule:
     - cron: "0 6 * * 1"
@@ -81,11 +81,56 @@ jobs:
             --all-projects
             --detection-depth=4
 
+      # Check if SARIF file exists and has content
+      - name: Verify SARIF file
+        id: verify-sarif
+        run: |
+          if [ -f "snyk-deps.sarif" ]; then
+            echo "SARIF file found"
+            echo "has_sarif=true" >> $GITHUB_OUTPUT
+            
+            # Check if file has multiple runs (which causes the error)
+            run_count=$(jq '.runs | length' snyk-deps.sarif 2>/dev/null || echo "0")
+            echo "Number of runs in SARIF: $run_count"
+            
+            if [ "$run_count" -gt 1 ]; then
+              echo "⚠️ Multiple runs detected. Splitting SARIF file..."
+              echo "needs_split=true" >> $GITHUB_OUTPUT
+            else
+              echo "needs_split=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No SARIF file found"
+            echo "has_sarif=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Split SARIF if it contains multiple runs
+      - name: Split multi-run SARIF
+        if: steps.verify-sarif.outputs.needs_split == 'true'
+        run: |
+          # Install jq if not available
+          which jq || sudo apt-get update && sudo apt-get install -y jq
+          
+          # Split SARIF into separate files, one per run
+          jq -c '.runs[]' snyk-deps.sarif | while IFS= read -r run; do
+            index=$((index + 1))
+            tool_name=$(echo "$run" | jq -r '.tool.driver.name // "snyk"' | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+            
+            # Create a new SARIF file with single run
+            echo "{\"version\": \"2.1.0\", \"\$schema\": \"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\", \"runs\": [$run]}" > "snyk-deps-${index}.sarif"
+            
+            echo "Created snyk-deps-${index}.sarif for $tool_name"
+          done
+          
+          # Remove original multi-run file
+          rm snyk-deps.sarif
+
       - name: Upload Snyk dependency SARIF to Security tab
+        if: steps.verify-sarif.outputs.has_sarif == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: snyk-deps.sarif
-          category: snyk-dotnet-dependencies
+          sarif_file: snyk-deps*.sarif
+          category: snyk-dotnet-dependencies-${{ github.run_id }}
 
       # Post a summary
       - name: Snyk dependency summary
@@ -93,7 +138,15 @@ jobs:
         run: |
           echo "## 🛡️ Snyk — NuGet Dependency Scan" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Results uploaded to the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)." >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.verify-sarif.outputs.has_sarif }}" == "true" ]; then
+            echo "✅ Scan completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Results uploaded to the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No SARIF file generated (no vulnerabilities found or scan failed)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Snyk monitors: [app.snyk.io](https://app.snyk.io)" >> $GITHUB_STEP_SUMMARY
 
@@ -106,6 +159,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: snyk-dependencies    # Run after dep scan
+    if: ${{ hashFiles('Dockerfile') != '' }}
 
     permissions:
       contents: read
@@ -124,7 +178,7 @@ jobs:
       - name: Build Docker image for scanning
         run: |
           docker build \
-            --tag globoticket-api:snyk-scan \
+            --tag weatherforecast-api:snyk-scan \
             --file Dockerfile \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
             .
@@ -137,7 +191,7 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
-          image: globoticket-api:snyk-scan
+          image: weatherforecast-api:snyk-scan
           args: >
             --file=Dockerfile
             --severity-threshold=high
@@ -145,10 +199,11 @@ jobs:
             --exclude-base-image-vulns
 
       - name: Upload Snyk container SARIF to Security tab
+        if: ${{ hashFiles('snyk-container.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: snyk-container.sarif
-          category: snyk-container-image
+          category: snyk-container-image-${{ github.run_id }}
 
       - name: Snyk container summary
         if: always()
@@ -157,7 +212,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`globoticket-api:snyk-scan\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`weatherforecast-api:snyk-scan\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Severity threshold | HIGH + CRITICAL |" >> $GITHUB_STEP_SUMMARY
           echo "| Results | [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) |" >> $GITHUB_STEP_SUMMARY
 
@@ -169,6 +224,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: snyk-dependencies
+    if: ${{ hashFiles('Dockerfile', 'k8s/**', '*.yaml', '*.yml') != '' }}
 
     permissions:
       contents: read
@@ -189,7 +245,15 @@ jobs:
             --severity-threshold=medium
 
       - name: Upload Snyk IaC SARIF to Security tab
+        if: ${{ hashFiles('snyk-iac.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: snyk-iac.sarif
-          category: snyk-iac
+          category: snyk-iac-${{ github.run_id }}
+
+      - name: Snyk IaC summary
+        if: always()
+        run: |
+          echo "## 🏗️ Snyk — Infrastructure as Code Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Results uploaded to the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)." >> $GITHUB_STEP_SUMMARY
