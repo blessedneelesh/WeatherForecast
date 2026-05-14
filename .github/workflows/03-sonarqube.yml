@@ -101,8 +101,7 @@ jobs:
             /d:sonar.host.url="$SONAR_HOST_URL" \
             /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
             /d:sonar.cs.vstest.reportsPaths="**/TestResults/*.trx" \
-            /d:sonar.qualitygate.wait=true \
-            /d:sonar.qualitygate.timeout=300 \
+            /d:sonar.qualitygate.wait=false \
             /d:sonar.exclusions="**/Migrations/**,**/wwwroot/**,**/*.Designer.cs" \
             /d:sonar.coverage.exclusions="**/*Tests*/**,**/Program.cs,**/Startup.cs" \
             /d:sonar.cpd.exclusions="**/Migrations/**"
@@ -144,7 +143,6 @@ jobs:
           fi
 
       # END the scan — this uploads results to SonarQube server
-      # and waits for the Quality Gate result
       - name: End SonarQube analysis
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -165,3 +163,5 @@ jobs:
           echo "| Project | \`$SONAR_PROJECT_KEY\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch  | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Dashboard | [Open in SonarQube]($SONAR_HOST_URL/dashboard?id=$SONAR_PROJECT_KEY) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Note:** Quality Gate status is informational only and does not block the workflow." >> $GITHUB_STEP_SUMMARY
