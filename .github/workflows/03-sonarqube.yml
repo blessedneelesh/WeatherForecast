@@ -116,8 +116,8 @@ jobs:
         run: |
           dotnet-coverage collect \
             "dotnet test --no-build --configuration Release --logger trx" \
-            --output coverage.xml \
-            --output-format xml
+            --output coverage.opencover.xml \
+            --output-format opencover
 
       # END the scan — this uploads results to SonarQube server
       # and waits for the Quality Gate result
