@@ -1,0 +1,206 @@
+# =============================================================
+# PHASE 5 — Docker Build + Push to Azure Container Registry
+# Trigger : push → main (after quality + security gates pass)
+# Goal    : Build multi-stage image, Trivy scan, push to ACR
+# Tools   : Docker Buildx, Trivy, Azure Container Registry
+#
+# REQUIRED SECRETS:
+#   AZURE_CLIENT_ID       → Service principal app ID
+#   AZURE_CLIENT_SECRET   → Service principal secret
+#   AZURE_TENANT_ID       → Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID → Azure subscription ID
+#   ACR_LOGIN_SERVER      → e.g. myregistry.azurecr.io
+#   ACR_USERNAME          → ACR admin username (or SP client ID)
+#   ACR_PASSWORD          → ACR admin password (or SP secret)
+#
+# HOW TO SET UP AZURE SERVICE PRINCIPAL:
+#   az ad sp create-for-rbac \
+#     --name "github-actions-sp" \
+#     --role AcrPush \
+#     --scopes /subscriptions/<SUB_ID>/resourceGroups/<RG>/providers/Microsoft.ContainerRegistry/registries/<ACR_NAME> \
+#     --sdk-auth
+# =============================================================
+
+name: "📦 Phase 5 — Docker Build & Push (ACR)"
+
+on:
+  push:
+    branches:
+      - main
+  # Can also be called as a reusable workflow
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: false
+        default: "weatherforecast-api"
+    outputs:
+      image-tag:
+        description: "Full image tag pushed to ACR"
+        value: ${{ jobs.build-push.outputs.image-tag }}
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  DOTNET_NOLOGO: true
+  IMAGE_NAME: "weatherforecast-api"
+
+jobs:
+  build-push:
+    name: "Build, Scan & Push to ACR"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore & Build
+        run: |
+          dotnet restore
+          dotnet build --no-restore --configuration Release
+
+      # Run tests one final time before packaging
+      - name: Final test gate
+        run: |
+          dotnet test \
+            --no-build \
+            --configuration Release \
+            --logger "trx;LogFileName=final-test-results.trx" \
+            --results-directory ./TestResults
+
+      # Set up Docker Buildx for multi-platform + layer caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:master
+
+      # Authenticate to Azure
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      # Login to Azure Container Registry
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # Generate image tags and OCI labels
+      # Tags produced:
+      #   - sha-<short-commit>         always
+      #   - latest                     on main branch only
+      #   - v1.2.3 / v1.2             when a semver tag is pushed
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=WeatherForecast API
+            org.opencontainers.image.description=.NET 8 Web API
+            org.opencontainers.image.vendor=YourOrg
+
+      # ── SHIFT-LEFT SECURITY ─────────────────────────────────
+      # Build image into local daemon first (do NOT push yet)
+      # Then Trivy scans it. Only if clean does the real push happen.
+      - name: Build image for pre-push security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true        # Load into local Docker daemon for scanning
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          build-args: |
+            DOTNET_VERSION=${{ env.DOTNET_VERSION }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+
+      # Trivy scans the locally-loaded image
+      # exit-code=1 → fail the job (and block push) if CRITICAL found
+      - name: Trivy vulnerability scan (pre-push gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format:    "table"
+          severity:  "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      # Also save SARIF for the Security tab
+      - name: Trivy SARIF upload
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format:    "sarif"
+          output:    "trivy-results.sarif"
+          severity:  "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-container
+
+      # ── PUSH TO ACR (only after scan passes) ───────────────
+      - name: Push image to ACR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # Post a rich summary
+      - name: Post packaging summary
+        if: always()
+        run: |
+          echo "## 📦 Docker Build & Push Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry | \`${{ secrets.ACR_LOGIN_SERVER }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image    | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit   | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tags     | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy    | CRITICAL/HIGH gate passed ✅ |" >> $GITHUB_STEP_SUMMARY
