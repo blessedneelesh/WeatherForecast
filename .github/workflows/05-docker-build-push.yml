@@ -26,7 +26,7 @@ name: "📦 Phase 5 — Docker Build & Push (ACR)"
 on:
   push:
     branches:
-      - master
+      - main
   # Can also be called as a reusable workflow
   workflow_call:
     inputs:

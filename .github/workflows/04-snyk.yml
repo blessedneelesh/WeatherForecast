@@ -18,11 +18,11 @@ name: "🛡️ Phase 4 — Snyk Security"
 on:
   push:
     branches:
-      - master
+      - main
       - develop
   pull_request:
     branches:
-      - master
+      - main
   # Weekly scan to catch newly published CVEs
   schedule:
     - cron: "0 6 * * 1"
