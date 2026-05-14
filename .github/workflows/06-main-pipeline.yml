@@ -353,6 +353,7 @@ jobs:
       # continue-on-error: true here so SARIF is always uploaded
       # Enforcement is handled by --fail-on=all below
       - name: Snyk dependency test
+        id: snyk-scan
         uses: snyk/actions/dotnet@master
         continue-on-error: true          # Upload SARIF even on findings
         env:
@@ -363,7 +364,6 @@ jobs:
             --sarif-file-output=snyk-deps.sarif
             --all-projects
             --detection-depth=4
-            --fail-on=all
 
       # Verify SARIF was generated before uploading
       - name: Verify SARIF file
@@ -372,32 +372,37 @@ jobs:
           if [ -f "snyk-deps.sarif" ]; then
             echo "has_sarif=true" >> $GITHUB_OUTPUT
             echo "✅ SARIF file found ($(wc -l < snyk-deps.sarif) lines)"
+            
+            # Check if SARIF has multiple runs
+            run_count=$(jq '.runs | length' snyk-deps.sarif 2>/dev/null || echo "1")
+            echo "Number of runs in SARIF: $run_count"
+            echo "run_count=$run_count" >> $GITHUB_OUTPUT
           else
             echo "has_sarif=false" >> $GITHUB_OUTPUT
             echo "⚠️ No SARIF file generated"
           fi
 
-      # Upload to GitHub Security tab — requires security-events: write
+      # Upload to GitHub Security tab with unique category per run
+      # Use run ID to ensure uniqueness across workflow runs
       - name: Upload Snyk SARIF to Security tab
         if: steps.verify-sarif.outputs.has_sarif == 'true'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: snyk-deps.sarif
-          category: snyk-main-ci
+          category: snyk-dotnet-dependencies-pipeline-${{ github.run_id }}
 
       # Enforcement step — this is what actually blocks the pipeline
       # Separated from the scan step so SARIF always uploads first
       - name: Enforce Snyk gate (block on HIGH/CRITICAL)
-        uses: snyk/actions/dotnet@master
-        continue-on-error: false         # ← HARD BLOCK on HIGH/CRITICAL
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: >
-            --severity-threshold=high
-            --fail-on=all
-            --all-projects
-            --detection-depth=4
+        if: steps.snyk-scan.outcome == 'failure'
+        run: |
+          echo "::error::Snyk found HIGH or CRITICAL vulnerabilities"
+          echo "❌ **Snyk Security Gate Failed**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "HIGH or CRITICAL vulnerabilities detected. Pipeline blocked." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Review findings in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning?query=is:open+tool:Snyk)" >> $GITHUB_STEP_SUMMARY
+          exit 1
 
       - name: Post Snyk summary
         if: always()
@@ -408,8 +413,18 @@ jobs:
           echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Severity threshold | HIGH + CRITICAL |" >> $GITHUB_STEP_SUMMARY
           echo "| Scope | All projects, depth 4 |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.snyk-scan.outcome }}" == "failure" ]; then
+            echo "| Status | ❌ **VULNERABILITIES DETECTED** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status | ✅ No vulnerabilities found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
           if [ "${{ steps.verify-sarif.outputs.has_sarif }}" == "true" ]; then
             echo "| SARIF | ✅ Uploaded to [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) |" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.verify-sarif.outputs.run_count }}" -gt "1" ]; then
+              echo "| Projects | ${{ steps.verify-sarif.outputs.run_count }} projects scanned |" >> $GITHUB_STEP_SUMMARY
+            fi
           else
             echo "| SARIF | ⚠️ Not generated |" >> $GITHUB_STEP_SUMMARY
           fi
