@@ -80,7 +80,6 @@ jobs:
             --sarif-file-output=snyk-deps.sarif
             --all-projects
             --detection-depth=4
-            --fail-on=upgradable    # ✅ Only fail if upgradable fix exists
 
       # Check if SARIF file exists
       - name: Verify SARIF file
