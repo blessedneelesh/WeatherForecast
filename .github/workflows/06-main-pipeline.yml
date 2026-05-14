@@ -351,7 +351,6 @@ jobs:
 
       # Matches 04-snyk.yml snyk-dependencies job args exactly
       # continue-on-error: true here so SARIF is always uploaded
-      # Enforcement is handled by --fail-on=all below
       - name: Snyk dependency test
         id: snyk-scan
         uses: snyk/actions/dotnet@master
@@ -365,34 +364,92 @@ jobs:
             --all-projects
             --detection-depth=4
 
-      # Verify SARIF was generated before uploading
-      - name: Verify SARIF file
+      # Verify and process SARIF file
+      - name: Verify and process SARIF file
         id: verify-sarif
         run: |
           if [ -f "snyk-deps.sarif" ]; then
             echo "has_sarif=true" >> $GITHUB_OUTPUT
             echo "✅ SARIF file found ($(wc -l < snyk-deps.sarif) lines)"
             
+            # Install jq if not available
+            which jq || sudo apt-get update && sudo apt-get install -y jq
+            
             # Check if SARIF has multiple runs
             run_count=$(jq '.runs | length' snyk-deps.sarif 2>/dev/null || echo "1")
             echo "Number of runs in SARIF: $run_count"
             echo "run_count=$run_count" >> $GITHUB_OUTPUT
+            
+            # If multiple runs, split into separate files
+            if [ "$run_count" -gt 1 ]; then
+              echo "⚠️ Multiple runs detected - splitting SARIF..."
+              
+              index=0
+              jq -c '.runs[]' snyk-deps.sarif | while IFS= read -r run; do
+                index=$((index + 1))
+                
+                # Extract project name from the run for unique category
+                project_name=$(echo "$run" | jq -r '.tool.driver.name // "project-'$index'"' | tr '[:upper:]' '[:lower:]' | tr ' /.\\' '-')
+                
+                # Create a new SARIF file with single run
+                sarif_file="snyk-deps-${index}.sarif"
+                echo "{\"version\": \"2.1.0\", \"\$schema\": \"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\", \"runs\": [$run]}" > "$sarif_file"
+                
+                echo "Created $sarif_file for $project_name"
+              done
+              
+              echo "needs_split=true" >> $GITHUB_OUTPUT
+              ls -lh snyk-deps-*.sarif
+            else
+              echo "Single run detected - no splitting needed"
+              echo "needs_split=false" >> $GITHUB_OUTPUT
+            fi
           else
             echo "has_sarif=false" >> $GITHUB_OUTPUT
             echo "⚠️ No SARIF file generated"
           fi
 
-      # Upload to GitHub Security tab with unique category per run
-      # Use run ID to ensure uniqueness across workflow runs
-      - name: Upload Snyk SARIF to Security tab
-        if: steps.verify-sarif.outputs.has_sarif == 'true'
+      # Upload single SARIF file (when no splitting needed)
+      - name: Upload single SARIF file
+        if: steps.verify-sarif.outputs.has_sarif == 'true' && steps.verify-sarif.outputs.needs_split == 'false'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: snyk-deps.sarif
-          category: snyk-dotnet-dependencies-pipeline-${{ github.run_id }}
+          category: snyk-dotnet-dependencies
+
+      # Upload split SARIF files (one per project)
+      - name: Upload split SARIF files
+        if: steps.verify-sarif.outputs.has_sarif == 'true' && steps.verify-sarif.outputs.needs_split == 'true'
+        run: |
+          # Upload each split SARIF file with unique category
+          index=0
+          for sarif_file in snyk-deps-*.sarif; do
+            if [ -f "$sarif_file" ]; then
+              index=$((index + 1))
+              
+              # Extract project name for category
+              project_name=$(jq -r '.runs[0].tool.driver.name // "project-'$index'"' "$sarif_file" | tr '[:upper:]' '[:lower:]' | tr ' /.\\' '-')
+              category="snyk-dotnet-${project_name}-${{ github.run_id }}"
+              
+              echo "📤 Uploading $sarif_file with category: $category"
+              
+              # Use GitHub CLI to upload (requires GITHUB_TOKEN)
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${{ github.repository }}/code-scanning/sarifs" \
+                -f "commit_sha=${{ github.sha }}" \
+                -f "ref=${{ github.ref }}" \
+                -f "sarif=@$sarif_file" \
+                -f "tool_name=Snyk" \
+                -f "category=$category" || echo "⚠️ Upload failed for $sarif_file"
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Enforcement step — this is what actually blocks the pipeline
-      # Separated from the scan step so SARIF always uploads first
       - name: Enforce Snyk gate (block on HIGH/CRITICAL)
         if: steps.snyk-scan.outcome == 'failure'
         run: |
@@ -422,8 +479,9 @@ jobs:
           
           if [ "${{ steps.verify-sarif.outputs.has_sarif }}" == "true" ]; then
             echo "| SARIF | ✅ Uploaded to [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) |" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ steps.verify-sarif.outputs.run_count }}" -gt "1" ]; then
-              echo "| Projects | ${{ steps.verify-sarif.outputs.run_count }} projects scanned |" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.verify-sarif.outputs.needs_split }}" == "true" ]; then
+              echo "| Projects | ${{ steps.verify-sarif.outputs.run_count }} projects scanned (split upload) |" >> $GITHUB_STEP_SUMMARY
             fi
           else
             echo "| SARIF | ⚠️ Not generated |" >> $GITHUB_STEP_SUMMARY
