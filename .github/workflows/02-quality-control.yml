@@ -10,7 +10,7 @@ name: "✅ Phase 2 — Quality Control"
 on:
   pull_request:
     branches:
-      - main
+      - master
       - develop
   # Also allow manual trigger for debugging
   workflow_dispatch:
