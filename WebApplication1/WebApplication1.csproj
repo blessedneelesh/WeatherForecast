@@ -8,6 +8,8 @@
 
   <ItemGroup>
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
+	  <PackageReference Include="Newtonsoft.Json" Version="9.0.1" />
+
   </ItemGroup>
 
 
