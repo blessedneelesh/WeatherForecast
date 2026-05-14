@@ -71,7 +71,7 @@ jobs:
       # --sarif-file-output      → upload to GitHub Security tab
       - name: Snyk dependency test
         uses: snyk/actions/dotnet@master
-        continue-on-error: true    # Don't block — upload results first
+        continue-on-error: false    # block — upload results first
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
