@@ -1,0 +1,137 @@
+﻿# =============================================================
+# PHASE 3 — SonarQube Code Quality Analysis
+# Trigger : pull_request → main/develop, push → main
+# Goal    : Static analysis, code smells, duplication, gates
+# Tools   : SonarQube (self-hosted or SonarCloud), .NET scanner
+#
+# REQUIRED SECRETS (set in repo Settings → Secrets):
+#   SONAR_TOKEN      → SonarQube/SonarCloud user token
+#   SONAR_HOST_URL   → e.g. https://sonarqube.yourcompany.com
+#                      or https://sonarcloud.io for SonarCloud
+#
+# REQUIRED VARIABLES (set in repo Settings → Variables):
+#   SONAR_PROJECT_KEY   → your-org_your-repo
+#   SONAR_ORGANIZATION  → (SonarCloud only) your org key
+# =============================================================
+
+name: "🔍 Phase 3 — SonarQube Analysis"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened]
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  sonarqube:
+    name: "SonarQube Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (full history for blame)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # SonarQube needs full git history for blame info
+
+      # Java 17 is required by the SonarQube scanner
+      - name: Setup Java 17 (SonarQube scanner dependency)
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # Cache SonarQube scanner packages between runs
+      - name: Cache SonarQube scanner
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-sonar-
+
+      # Install the SonarQube .NET scanner tool globally
+      - name: Install SonarQube scanner
+        run: |
+          dotnet tool install --global dotnet-sonarscanner
+          dotnet tool install --global dotnet-coverage
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # --------------------------------------------------------
+      # BEGIN SonarQube scan
+      # The scanner wraps the build step to intercept the compiler
+      # and collect symbol information for analysis.
+      # --------------------------------------------------------
+      - name: Begin SonarQube analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet sonarscanner begin \
+            /k:"${{ vars.SONAR_PROJECT_KEY }}" \
+            /o:"${{ vars.SONAR_ORGANIZATION }}" \
+            /d:sonar.token="${{ secrets.SONAR_TOKEN }}" \
+            /d:sonar.host.url="${{ secrets.SONAR_HOST_URL }}" \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
+            /d:sonar.cs.vstest.reportsPaths="**/TestResults/*.trx" \
+            /d:sonar.qualitygate.wait=true \
+            /d:sonar.qualitygate.timeout=300 \
+            /d:sonar.exclusions="**/Migrations/**,**/wwwroot/**,**/*.Designer.cs" \
+            /d:sonar.coverage.exclusions="**/*Tests*/**,**/Program.cs,**/Startup.cs" \
+            /d:sonar.cpd.exclusions="**/Migrations/**"
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # Collect test coverage in OpenCover format (required by SonarQube)
+      - name: Run tests with OpenCover coverage
+        run: |
+          dotnet-coverage collect \
+            "dotnet test --no-build --configuration Release --logger trx" \
+            --output coverage.xml \
+            --output-format xml
+
+      # END the scan — this uploads results to SonarQube server
+      # and waits for the Quality Gate result
+      - name: End SonarQube analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}
+        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+      # Post a summary with the SonarQube dashboard link
+      - name: Post SonarQube summary
+        if: always()
+        run: |
+          echo "## 🔍 SonarQube Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | \`${{ vars.SONAR_PROJECT_KEY }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch  | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | [Open in SonarQube](${{ secrets.SONAR_HOST_URL }}/dashboard?id=${{ vars.SONAR_PROJECT_KEY }}) |" >> $GITHUB_STEP_SUMMARY
