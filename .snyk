@@ -1,0 +1,39 @@
+﻿# =============================================================
+# Snyk Policy File (.snyk)
+# Place this file in the ROOT of your repository
+# Documentation: https://docs.snyk.io/snyk-cli/test-for-vulnerabilities/the-.snyk-file
+#
+# Use this file to:
+#   - Ignore specific vulnerabilities (with reason + expiry)
+#   - Set patch policies
+#   - Configure language-specific settings
+# =============================================================
+
+version: v1.25.0
+
+# ── Ignore rules ─────────────────────────────────────────────
+# Add entries here only after security team review.
+# Every ignore MUST have a reason and an expiry date.
+# Format:
+#   <SNYK-VULNERABILITY-ID>:
+#     - '*':
+#         reason: <why this is acceptable>
+#         expires: <ISO date>
+#         created: <ISO date>
+
+ignore:
+  # Example — remove or replace with real entries:
+  # SNYK-DOTNET-MICROSOFTASPNETCOREAPP-123456:
+  #   - '*':
+  #       reason: "No fix available; mitigated by WAF rule WF-001"
+  #       expires: 2025-06-01T00:00:00.000Z
+  #       created: 2025-01-01T00:00:00.000Z
+
+# ── Patch policies ───────────────────────────────────────────
+patch: {}
+
+# ── Language settings ────────────────────────────────────────
+# .NET specific settings
+language-settings:
+  dotnet:
+    # targetFramework: net8.0   # uncomment to pin framework
