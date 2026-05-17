@@ -38,7 +38,7 @@ RUN dotnet publish "WebApplication1.csproj" \
     /p:PublishSingleFile=false
 
 # ── Stage 3: Final runtime image ─────────────────────────────
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS final
 
 # Build arguments for OCI labels (set by GitHub Actions metadata-action)
 ARG BUILD_DATE
