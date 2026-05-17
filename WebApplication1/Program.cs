@@ -12,7 +12,10 @@ public partial class Program
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
 
-            var app = builder.Build();
+            // Add health checks
+            builder.Services.AddHealthChecks();
+
+        var app = builder.Build();
 
             // Configure the HTTP request pipeline.
             if (app.Environment.IsDevelopment())
@@ -21,7 +24,10 @@ public partial class Program
                 app.UseSwaggerUI();
             }
 
-            app.UseHttpsRedirection();
+            // Health check endpoint - returns 200 OK if app is healthy
+            app.MapHealthChecks("/health");
+
+        app.UseHttpsRedirection();
 
             app.UseAuthorization();
 
