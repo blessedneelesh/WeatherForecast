@@ -116,8 +116,9 @@ jobs:
             --settings \
               ASPNETCORE_ENVIRONMENT=Staging \
               ASPNETCORE_URLS="http://+:8080" \
-              DOCKER_REGISTRY_SERVER_URL="https://${{ secrets.ACR_LOGIN_SERVER }}" \
-              WEBSITES_PORT=8080
+              ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
+              WEBSITES_PORT=8080 \
+              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false
 
       # PDF: "use azure/webapps-deploy to deploy your application
       #       to Azure App Service"
