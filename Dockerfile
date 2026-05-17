@@ -28,14 +28,7 @@ FROM restore AS build
 COPY . .
 WORKDIR "/src/WebApplication1"
 
-RUN dotnet publish "WebApplication1.csproj" \
-    --configuration Release \
-    --no-restore \
-    --runtime linux-x64 \
-    --self-contained false \
-    --output /app/publish \
-    /p:UseAppHost=false \
-    /p:PublishSingleFile=false
+RUN dotnet build "WebApplication1.csproj" -c Release -o /app/build
 
 # ── Stage 3: Final runtime image ─────────────────────────────
 FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS final
@@ -52,34 +45,19 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.description=".NET 8 Web API" \
       org.opencontainers.image.base.name="mcr.microsoft.com/dotnet/aspnet:8.0"
 
+# Update OS packages to get security patches
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-
-# Install curl (required by HEALTHCHECK; not present in the base image),
-# then create a non-root user and group for security
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 1000 appgroup \
-    && useradd --uid 1000 --gid appgroup --shell /bin/bash --create-home appuser \
-    && chown -R appuser:appgroup /app
-
-# Copy published output from build stage
-COPY --from=build --chown=appuser:appgroup /app/publish .
-
-# Switch to non-root user
-USER appuser
-
-# ASP.NET Core configuration
-ENV ASPNETCORE_URLS=http://+:8080
-ENV ASPNETCORE_ENVIRONMENT=Production
-ENV DOTNET_RUNNING_IN_CONTAINER=true
-ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
-
 EXPOSE 8080
 
-# Probes the existing Add endpoint. Replace with a dedicated /health endpoint
-# (e.g. builder.Services.AddHealthChecks(); app.MapHealthChecks("/health"); )
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f "http://localhost:8080/WeatherForecast/add?a=1&b=1" || exit 1
+# Non-root user for security
+RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
+USER appuser
 
+# Copy published output from build stage
+COPY --from=publish /app/publish .
 ENTRYPOINT ["dotnet", "WebApplication1.dll"]
