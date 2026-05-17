@@ -30,6 +30,13 @@ WORKDIR "/src/WebApplication1"
 
 RUN dotnet build "WebApplication1.csproj" -c Release -o /app/build
 
+# Publish stage
+FROM build AS publish
+RUN dotnet publish "WebApplication1.csproj" \
+    -c Release \
+    -o /app/publish \
+    /p:UseAppHost=false
+
 # ── Stage 3: Final runtime image ─────────────────────────────
 FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS final
 
@@ -58,6 +65,6 @@ EXPOSE 8080
 RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 USER appuser
 
-# Copy published output from build stage
+# Copy published output from publish stage
 COPY --from=publish /app/publish .
 ENTRYPOINT ["dotnet", "WebApplication1.dll"]
