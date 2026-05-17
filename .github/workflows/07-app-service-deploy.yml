@@ -143,12 +143,18 @@ jobs:
       # Wait for the app to be healthy before smoke tests
       - name: Wait for staging slot health check
         run: |
-          URL="${{ steps.get-slot-url.outputs.url }}/health"
-          echo "Polling health endpoint: $URL"
+          # Azure App Service responds on port 443 (HTTPS) externally
+          # but internally health checks may use HTTP
+          BASE="${{ steps.get-slot-url.outputs.url }}"
+          echo "Polling health endpoint: $BASE/health"
+          
           for i in $(seq 1 15); do
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            # Try HTTPS first (external URL)
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/health" || echo "000")
             echo "Attempt $i: HTTP $HTTP_STATUS"
-            if [ "$HTTP_STATUS" = "200" ]; then
+            
+            # Accept 200 (OK) or 307 (redirect) as healthy
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "307" ]; then
               echo "✅ Staging slot is healthy."
               exit 0
             fi
