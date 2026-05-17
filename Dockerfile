@@ -61,6 +61,10 @@ RUN apt-get update && \
 WORKDIR /app
 EXPOSE 8080
 
+# Set environment for Azure App Service
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_FORWARDEDHEADERS_ENABLED=true
+
 # Non-root user for security
 RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 USER appuser
