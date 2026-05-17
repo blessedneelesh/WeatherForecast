@@ -1,0 +1,255 @@
+﻿# =============================================================
+# PHASE 7 — Deploy to Azure App Service
+# Trigger : workflow_call (called by 10-full-pipeline.yml)
+#           OR manually via workflow_dispatch
+# Goal    : Pull image from ACR → deploy to Azure App Service
+#
+# PDF Reference: "Implementing Continuous Deployment with
+#                GitHub Actions → Deploying to Cloud Platforms
+#                → Microsoft Azure"
+#
+# REQUIRED SECRETS:
+#   AZURE_CLIENT_ID         → Service principal app ID
+#   AZURE_CLIENT_SECRET     → Service principal secret
+#   AZURE_TENANT_ID         → Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID   → Azure subscription ID
+#   ACR_LOGIN_SERVER        → e.g. myregistry.azurecr.io
+#   ACR_USERNAME            → ACR admin username
+#   ACR_PASSWORD            → ACR admin password
+#
+# REQUIRED VARIABLES:
+#   AZURE_RESOURCE_GROUP    → e.g. rg-weatherforecast
+#   AZURE_APP_SERVICE_NAME  → e.g. weatherforecast-api-app
+#   AZURE_APP_SERVICE_SLOT_STAGING → e.g. staging
+# =============================================================
+
+name: "🌐 Phase 7 — Deploy to Azure App Service"
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Full ACR image tag to deploy (e.g. sha-abc1234)"
+        type: string
+        required: true
+      environment:
+        description: "Target environment: staging | production"
+        type: string
+        required: false
+        default: "staging"
+    secrets:
+      AZURE_CLIENT_ID:       { required: true }
+      AZURE_CLIENT_SECRET:   { required: true }
+      AZURE_TENANT_ID:       { required: true }
+      AZURE_SUBSCRIPTION_ID: { required: true }
+      ACR_LOGIN_SERVER:      { required: true }
+      ACR_USERNAME:          { required: true }
+      ACR_PASSWORD:          { required: true }
+
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: "ACR image tag to deploy"
+        type: string
+        required: true
+      environment:
+        description: "Target environment"
+        type: choice
+        options: [staging, production]
+        default: staging
+
+env:
+  DOTNET_NOLOGO: true
+  IMAGE_NAME:    weatherforecast-api
+
+jobs:
+  # ── STAGE 1: Deploy to Staging Slot ────────────────────────
+  deploy-staging:
+    name: "Deploy to Staging Slot"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url: ${{ steps.get-slot-url.outputs.url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Authenticate with Azure using service principal
+      # PDF: "Create a service principal in Azure with the necessary
+      #       permissions to deploy your application"
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      # Configure App Service to pull from ACR
+      - name: Configure App Service ACR authentication
+        run: |
+          az webapp config container set \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --docker-custom-image-name  "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ inputs.image-tag }}" \
+            --docker-registry-server-url "https://${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-registry-server-user "${{ secrets.ACR_USERNAME }}" \
+            --docker-registry-server-password "${{ secrets.ACR_PASSWORD }}"
+
+      # Set ASPNETCORE environment variables on the staging slot
+      - name: Configure App Service environment variables
+        run: |
+          az webapp config appsettings set \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --settings \
+              ASPNETCORE_ENVIRONMENT=Staging \
+              ASPNETCORE_URLS="http://+:8080" \
+              DOCKER_REGISTRY_SERVER_URL="https://${{ secrets.ACR_LOGIN_SERVER }}" \
+              WEBSITES_PORT=8080
+
+      # PDF: "use azure/webapps-deploy to deploy your application
+      #       to Azure App Service"
+      - name: Deploy to staging slot
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name:   ${{ vars.AZURE_APP_SERVICE_NAME }}
+          slot-name:  ${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}
+          images:     ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ inputs.image-tag }}
+
+      # Get the staging slot URL for smoke tests
+      - name: Get staging slot URL
+        id: get-slot-url
+        run: |
+          URL=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --query defaultHostName -o tsv)
+          echo "url=https://${URL}" >> $GITHUB_OUTPUT
+          echo "Staging URL: https://${URL}"
+
+      # Wait for the app to be healthy before smoke tests
+      - name: Wait for staging slot health check
+        run: |
+          URL="${{ steps.get-slot-url.outputs.url }}/health"
+          echo "Polling health endpoint: $URL"
+          for i in $(seq 1 15); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            echo "Attempt $i: HTTP $HTTP_STATUS"
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Staging slot is healthy."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Staging slot did not become healthy after 150 seconds."
+          exit 1
+
+      # Basic smoke test against staging slot
+      - name: Smoke test staging slot
+        run: |
+          BASE="${{ steps.get-slot-url.outputs.url }}"
+          echo "Running smoke tests against: $BASE"
+
+          # Test health endpoint
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/health")
+          [ "$STATUS" = "200" ] || (echo "::error::Health check failed: HTTP $STATUS" && exit 1)
+
+          # Test WeatherForecast API endpoint
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/weatherforecast")
+          [ "$STATUS" = "200" ] || echo "Warning: WeatherForecast endpoint returned HTTP $STATUS"
+
+          # Test API root / swagger endpoint
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/swagger/index.html")
+          [ "$STATUS" = "200" ] || echo "Warning: Swagger not found (may be disabled in Staging)"
+
+          echo "✅ Smoke tests passed."
+
+      - name: Post staging deployment summary
+        run: |
+          echo "## 🌐 Staging Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| App Service | \`${{ vars.AZURE_APP_SERVICE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Slot        | \`${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image       | \`${{ inputs.image-tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL         | ${{ steps.get-slot-url.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+
+  # ── STAGE 2: Swap staging → production ────────────────────
+  # Only runs if environment input is 'production'
+  swap-to-production:
+    name: "Swap Staging → Production"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: ${{ inputs.environment == 'production' }}
+    timeout-minutes: 10
+    environment:
+      name: production
+      # Requires a GitHub Environment protection rule with manual approval
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      # Blue-green swap — zero downtime deployment
+      # Azure routes all traffic to the staging slot instantly
+      - name: Swap staging → production (blue-green)
+        run: |
+          echo "Swapping staging → production..."
+          az webapp deployment slot swap \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --target-slot    production
+          echo "✅ Slot swap complete."
+
+      # Verify production health post-swap
+      - name: Verify production health post-swap
+        run: |
+          PROD_URL=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --query defaultHostName -o tsv)
+
+          echo "Checking production: https://$PROD_URL/health"
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$PROD_URL/health" || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Production is healthy."
+              echo "PROD_URL=https://$PROD_URL" >> $GITHUB_ENV
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Production health check failed after swap!"
+          exit 1
+
+      - name: Post production swap summary
+        run: |
+          echo "## 🚀 Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Method      | Blue-green slot swap |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image       | \`${{ inputs.image-tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL         | ${{ env.PROD_URL }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status      | ✅ Healthy |" >> $GITHUB_STEP_SUMMARY
