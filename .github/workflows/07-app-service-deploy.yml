@@ -21,6 +21,10 @@
 #   AZURE_RESOURCE_GROUP    → e.g. rg-weatherforecast
 #   AZURE_APP_SERVICE_NAME  → e.g. weatherforecast-api-app
 #   AZURE_APP_SERVICE_SLOT_STAGING → e.g. staging
+#
+# REQUIRED PERMISSIONS:
+#   Service Principal must have "Contributor" or "Website Contributor"
+#   role on the App Service or Resource Group
 # =============================================================
 
 name: "🌐 Phase 7 — Deploy to Azure App Service"
@@ -97,10 +101,10 @@ jobs:
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
             --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
-            --docker-custom-image-name  "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ inputs.image-tag }}" \
-            --docker-registry-server-url "https://${{ secrets.ACR_LOGIN_SERVER }}" \
-            --docker-registry-server-user "${{ secrets.ACR_USERNAME }}" \
-            --docker-registry-server-password "${{ secrets.ACR_PASSWORD }}"
+            --container-image-name  "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ inputs.image-tag }}" \
+            --container-registry-url "https://${{ secrets.ACR_LOGIN_SERVER }}" \
+            --container-registry-user "${{ secrets.ACR_USERNAME }}" \
+            --container-registry-password "${{ secrets.ACR_PASSWORD }}"
 
       # Set ASPNETCORE environment variables on the staging slot
       - name: Configure App Service environment variables
