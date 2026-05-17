@@ -183,6 +183,25 @@ jobs:
 
           echo "✅ Smoke tests passed."
 
+      # Verify container configuration
+      - name: Verify container configuration
+        run: |
+          echo "Checking container configuration..."
+          az webapp config show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --query "{containerImage:linuxFxVersion,port:appSettings[?name=='WEBSITES_PORT'].value|[0]}" \
+            -o json
+          
+          echo "Checking if container is pulling image..."
+          az webapp log deployment show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --query "[0].{status:status,details:details}" \
+            -o json || echo "No deployment logs available"
+
       - name: Post staging deployment summary
         run: |
           echo "## 🌐 Staging Deployment" >> $GITHUB_STEP_SUMMARY
