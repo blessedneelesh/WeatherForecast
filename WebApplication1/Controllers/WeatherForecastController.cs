@@ -35,5 +35,11 @@ namespace WebApplication1.Controllers
         {
             return a + b;
         }
+
+        [HttpGet("subtract", Name = "SubtractNumbers")]
+        public int Subtract(int a, int b)
+        {
+            return a - b;
+        }
     }
 }
