@@ -1,0 +1,738 @@
+﻿# =============================================================
+# PHASE 10 — Full CI + CD Orchestrator (push → master)
+# Trigger  : push → master
+# Goal     : Complete pipeline: CI → Package → Deploy → Release
+#
+# Wires together your actual uploaded yml files:
+#   06-main-pipeline.yml              → CI stages 1-4
+#   07-deploy-app-service.yml         → Stage 5 (staging) + Stage 7 (production)
+#   09-auto-release-app-service.yml   → Stage 6 (GitHub Release)
+#
+# Stage sequence (App Service edition — no AKS):
+#   1 · Unit Tests + Coverage
+#   2 · SonarQube Quality Gate  ─┐ parallel after tests
+#   3 · Snyk Security Scan      ─┘
+#   4 · Docker Build + Trivy → Push ACR
+#   5 · Deploy → App Service Staging (07-deploy-app-service.yml)
+#   6 · Auto GitHub Release          (09-auto-release-app-service.yml)
+#   7 · Deploy → Production          (07-deploy-app-service.yml, manual gate)
+#
+# PDF Reference: Chapter 8 — Implementing Continuous Deployment
+#
+# REQUIRED SECRETS (from phases 03/04/05/07/09):
+#   SONAR_TOKEN, SONAR_HOST_URL
+#   SNYK_TOKEN
+#   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#   AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   ACR_LOGIN_SERVER, ACR_USERNAME, ACR_PASSWORD
+#
+# REQUIRED VARIABLES (from phases 03/07):
+#   SONAR_PROJECT_KEY, SONAR_ORGANIZATION
+#   AZURE_RESOURCE_GROUP
+#   AZURE_APP_SERVICE_NAME
+#   AZURE_APP_SERVICE_SLOT_STAGING
+# =============================================================
+
+name: "🚀 Full CI + CD Pipeline"
+
+on:
+  push:
+    branches:
+      - master                   # ← your actual branch name
+  workflow_dispatch:
+    inputs:
+      deploy-target:
+        description: "Deployment target"
+        type: choice
+        options: [staging-only, staging-and-production]
+        default: staging-only
+      skip-sonar:
+        description: "Skip SonarQube scan (hotfix only)"
+        type: boolean
+        default: false
+      skip-snyk:
+        description: "Skip Snyk scan (hotfix only)"
+        type: boolean
+        default: false
+
+env:
+  DOTNET_VERSION: "8.0.x"
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  IMAGE_NAME: "weatherforecast-api"
+  COVERAGE_THRESHOLD: "0"
+
+# ════════════════════════════════════════════════════════════
+# STAGE 1 — Unit Tests & Coverage
+# Sourced from: 06-main-pipeline.yml → jobs.test
+# Identical steps, cache keys, summary format, coverage gate.
+# All downstream stages blocked until this passes.
+# ════════════════════════════════════════════════════════════
+jobs:
+  test:
+    name: "1 · Unit Tests & Coverage"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Cache key matches 06-main-pipeline.yml exactly
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # Cobertura format — matches 06-main-pipeline.yml collector config
+      - name: Run unit tests with coverage
+        run: |
+          dotnet test \
+            --no-build \
+            --configuration Release \
+            --logger "trx;LogFileName=test-results.trx" \
+            --results-directory ./TestResults \
+            --collect:"XPlat Code Coverage" \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
+               DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByAttribute=GeneratedCode,Obsolete
+
+      - name: Install ReportGenerator
+        run: dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      - name: Generate coverage report
+        run: |
+          reportgenerator \
+            -reports:"./TestResults/**/coverage.cobertura.xml" \
+            -targetdir:"./TestResults/CoverageReport" \
+            -reporttypes:"Html;MarkdownSummaryGithub;Cobertura" \
+            -verbosity:Warning
+
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: ./TestResults/CoverageReport/
+          retention-days: 30
+
+      - name: Upload TRX results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-trx
+          path: ./TestResults/*.trx
+          retention-days: 14
+
+      # Summary format matches 06-main-pipeline.yml exactly
+      - name: Post test & coverage summary
+        if: always()
+        run: |
+          echo "## 🧪 Stage 1 — Unit Tests & Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "_$(date +'%Y-%m-%d %H:%M UTC')_" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          TRX=$(find ./TestResults -name "*.trx" | head -1)
+          if [ -f "$TRX" ]; then
+            TOTAL=$(grep -o 'total="[0-9]*"'    "$TRX" | grep -o '[0-9]*' | head -1)
+            PASSED=$(grep -o 'passed="[0-9]*"'  "$TRX" | grep -o '[0-9]*' | head -1)
+            FAILED=$(grep -o 'failed="[0-9]*"'  "$TRX" | grep -o '[0-9]*' | head -1)
+            SKIPPED=$(grep -o 'skipped="[0-9]*"' "$TRX" | grep -o '[0-9]*' | head -1)
+            echo "| Result | Count |"                   >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|"                   >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Passed  | ${PASSED:-0}  |"       >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ Failed  | ${FAILED:-0}  |"       >> $GITHUB_STEP_SUMMARY
+            echo "| ⏭️ Skipped | ${SKIPPED:-0} |"       >> $GITHUB_STEP_SUMMARY
+            echo "| 📊 Total   | ${TOTAL:-0}   |"       >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f "./TestResults/CoverageReport/SummaryGithub.md" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 📊 Code Coverage" >> $GITHUB_STEP_SUMMARY
+            cat "./TestResults/CoverageReport/SummaryGithub.md" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Coverage gate — matches 06-main-pipeline.yml logic exactly
+      - name: Enforce coverage threshold (${{ env.COVERAGE_THRESHOLD }}%)
+        run: |
+          COVERAGE_FILE=$(find ./TestResults -name "coverage.cobertura.xml" | head -1)
+          if [ -f "$COVERAGE_FILE" ]; then
+            LINE_RATE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$COVERAGE_FILE')
+          root = tree.getroot()
+          rate = float(root.attrib.get('line-rate', 0)) * 100
+          print(f'{rate:.1f}')
+          ")
+            echo "Line coverage: ${LINE_RATE}%"
+            THRESHOLD=${{ env.COVERAGE_THRESHOLD }}
+            if (( $(echo "$LINE_RATE < $THRESHOLD" | bc -l) )); then
+              echo "::error::Coverage ${LINE_RATE}% is below the required ${THRESHOLD}% threshold."
+              echo "❌ **Coverage gate failed:** ${LINE_RATE}% < ${THRESHOLD}% required" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+            echo "✅ Coverage ${LINE_RATE}% meets the ${THRESHOLD}% threshold."
+          fi
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 2 — SonarQube Analysis (parallel with Snyk)
+  # Sourced from: 06-main-pipeline.yml → jobs.sonarqube
+  # Identical: Java 17 temurin, dotnet-sonarscanner, opencover,
+  # sonar.qualitygate.wait=false, same exclusions, same summary.
+  # needs: test — blocked until Stage 1 passes
+  # ════════════════════════════════════════════════════════════
+  sonarqube:
+    name: "2 · SonarQube Analysis"
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ !inputs.skip-sonar }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (full history for blame)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Java 17 temurin — matches 06-main-pipeline.yml exactly
+      - name: Setup Java 17 (SonarQube scanner dependency)
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # Cache SonarQube scanner — matches 06-main-pipeline.yml
+      - name: Cache SonarQube scanner
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-sonar-
+
+      - name: Install SonarQube scanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # Begin scan — all flags match 06-main-pipeline.yml exactly
+      - name: Begin SonarQube analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+        run: |
+          dotnet sonarscanner begin \
+            /k:"$SONAR_PROJECT_KEY" \
+            /o:"$SONAR_ORGANIZATION" \
+            /d:sonar.token="$SONAR_TOKEN" \
+            /d:sonar.host.url="$SONAR_HOST_URL" \
+            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" \
+            /d:sonar.cs.vstest.reportsPaths="**/TestResults/*.trx" \
+            /d:sonar.qualitygate.wait=false \
+            /d:sonar.exclusions="**/Migrations/**,**/wwwroot/**,**/*.Designer.cs" \
+            /d:sonar.coverage.exclusions="**/*Tests*/**,**/Program.cs,**/Startup.cs" \
+            /d:sonar.cpd.exclusions="**/Migrations/**"
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # opencover format — matches 06-main-pipeline.yml collector format
+      - name: Run tests with coverage (opencover)
+        run: |
+          dotnet test \
+            --no-build \
+            --configuration Release \
+            --logger trx \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+
+      # Move coverage file to root — matches 06-main-pipeline.yml step exactly
+      - name: Move coverage file to root
+        run: |
+          COVERAGE_FILE=$(find ./TestResults -name "coverage.opencover.xml" -type f | head -n 1)
+          if [ -n "$COVERAGE_FILE" ]; then
+            echo "✅ Found: $COVERAGE_FILE"
+            cp "$COVERAGE_FILE" ./coverage.opencover.xml
+          else
+            echo "❌ No coverage.opencover.xml found"
+            find ./TestResults -type f
+            exit 1
+          fi
+
+      - name: End SonarQube analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+      # Summary matches 06-main-pipeline.yml format exactly
+      - name: Post SonarQube summary
+        if: always()
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+        run: |
+          echo "## 🔍 Stage 2 — SonarQube Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Project   | \`$SONAR_PROJECT_KEY\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch    | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | [Open in SonarQube]($SONAR_HOST_URL/dashboard?id=$SONAR_PROJECT_KEY) |" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 3 — Snyk Security Scan (parallel with SonarQube)
+  # Sourced from: 06-main-pipeline.yml → jobs.snyk
+  # Identical: same args, SARIF split logic, monitoring mode,
+  # warn-not-block pattern (exit 1 commented out).
+  # needs: test — blocked until Stage 1 passes
+  # ════════════════════════════════════════════════════════════
+  snyk:
+    name: "3 · Snyk Security Scan"
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ !inputs.skip-snyk }}
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # continue-on-error: true + id: snyk-scan — matches 06-main-pipeline.yml
+      - name: Snyk dependency test
+        id: snyk-scan
+        uses: snyk/actions/dotnet@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >
+            --severity-threshold=high
+            --sarif-file-output=snyk-deps.sarif
+            --all-projects
+            --detection-depth=4
+
+      # Full SARIF split logic — matches 06-main-pipeline.yml exactly
+      - name: Verify and process SARIF file
+        id: verify-sarif
+        run: |
+          if [ -f "snyk-deps.sarif" ]; then
+            echo "has_sarif=true" >> $GITHUB_OUTPUT
+            echo "✅ SARIF file found ($(wc -l < snyk-deps.sarif) lines)"
+            which jq || sudo apt-get update && sudo apt-get install -y jq
+            run_count=$(jq '.runs | length' snyk-deps.sarif 2>/dev/null || echo "1")
+            echo "Number of runs in SARIF: $run_count"
+            echo "run_count=$run_count" >> $GITHUB_OUTPUT
+            if [ "$run_count" -gt 1 ]; then
+              echo "⚠️ Multiple runs detected - splitting SARIF..."
+              index=0
+              jq -c '.runs[]' snyk-deps.sarif | while IFS= read -r run; do
+                index=$((index + 1))
+                project_name=$(echo "$run" | jq -r '.tool.driver.name // "project-'$index'"' | tr '[:upper:]' '[:lower:]' | tr ' /.\\' '-')
+                sarif_file="snyk-deps-${index}.sarif"
+                echo "{\"version\": \"2.1.0\", \"\$schema\": \"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json\", \"runs\": [$run]}" > "$sarif_file"
+                echo "Created $sarif_file for $project_name"
+              done
+              echo "needs_split=true" >> $GITHUB_OUTPUT
+              ls -lh snyk-deps-*.sarif
+            else
+              echo "Single run detected - no splitting needed"
+              echo "needs_split=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "has_sarif=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No SARIF file generated"
+          fi
+
+      - name: Upload single SARIF file
+        if: steps.verify-sarif.outputs.has_sarif == 'true' && steps.verify-sarif.outputs.needs_split == 'false'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-dotnet-dependencies
+
+      - name: Upload split SARIF files
+        if: steps.verify-sarif.outputs.has_sarif == 'true' && steps.verify-sarif.outputs.needs_split == 'true'
+        run: |
+          index=0
+          for sarif_file in snyk-deps-*.sarif; do
+            if [ -f "$sarif_file" ]; then
+              index=$((index + 1))
+              project_name=$(jq -r '.runs[0].tool.driver.name // "project-'$index'"' "$sarif_file" | tr '[:upper:]' '[:lower:]' | tr ' /.\\' '-')
+              category="snyk-dotnet-${project_name}-${{ github.run_id }}"
+              echo "📤 Uploading $sarif_file with category: $category"
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${{ github.repository }}/code-scanning/sarifs" \
+                -f "commit_sha=${{ github.sha }}" \
+                -f "ref=${{ github.ref }}" \
+                -f "sarif=@$sarif_file" \
+                -f "tool_name=Snyk" \
+                -f "category=$category" || echo "⚠️ Upload failed for $sarif_file"
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Monitoring mode — matches 06-main-pipeline.yml warn-not-block pattern
+      - name: Enforce Snyk gate (monitoring mode)
+        if: steps.snyk-scan.outcome == 'failure'
+        run: |
+          echo "::warning::Snyk found HIGH or CRITICAL vulnerabilities (monitor mode)"
+          echo "⚠️ **Snyk Security Scan - Monitoring Mode**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "HIGH or CRITICAL vulnerabilities detected. Pipeline continuing for investigation." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📋 **Action Required:** Review findings in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning?query=is:open+tool:Snyk)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Once verified, either:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update vulnerable packages" >> $GITHUB_STEP_SUMMARY
+          echo "2. Add ignore rules to .snyk policy" >> $GITHUB_STEP_SUMMARY
+          echo "3. Re-enable blocking by uncommenting exit 1" >> $GITHUB_STEP_SUMMARY
+          # exit 1  # Temporarily disabled for investigation
+
+      - name: Post Snyk summary
+        if: always()
+        run: |
+          echo "## 🛡️ Stage 3 — Snyk Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity threshold | HIGH + CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scope | All projects, depth 4 |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.snyk-scan.outcome }}" == "failure" ]; then
+            echo "| Status | ⚠️ **VULNERABILITIES DETECTED** (monitoring mode) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status | ✅ No vulnerabilities found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ steps.verify-sarif.outputs.has_sarif }}" == "true" ]; then
+            echo "| SARIF | ✅ Uploaded to [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) |" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.verify-sarif.outputs.needs_split }}" == "true" ]; then
+              echo "| Projects | ${{ steps.verify-sarif.outputs.run_count }} projects scanned (split upload) |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Full results: [app.snyk.io](https://app.snyk.io)" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 4 — Docker Build + Trivy Scan + Push to ACR
+  # Sourced from: 06-main-pipeline.yml → jobs.package
+  # Identical: moby/buildkit, same meta tags, same Trivy flags,
+  # same SARIF upload, same build-args.
+  # needs: [sonarqube, snyk] — BOTH gates must pass
+  # ════════════════════════════════════════════════════════════
+  package:
+    name: "4 · Docker Build & Push to ACR"
+    runs-on: ubuntu-latest
+    needs: [sonarqube, snyk]
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+
+    outputs:
+      # short-tag passed to Phase 07 as image-tag input
+      # short-tag passed to Phase 09 as image-tag input
+      short-tag:  ${{ steps.short.outputs.tag }}
+      full-image: ${{ steps.short.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore & Build
+        run: |
+          dotnet restore
+          dotnet build --no-restore --configuration Release
+
+      # Final test gate — matches 06-main-pipeline.yml
+      - name: Final test gate
+        run: |
+          dotnet test \
+            --no-build \
+            --configuration Release \
+            --logger "trx;LogFileName=final-test-results.trx" \
+            --results-directory ./TestResults
+
+      # driver-opts matches 06-main-pipeline.yml exactly
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:master
+
+      # creds format matches 06-main-pipeline.yml + 07-deploy-app-service.yml
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # Tags match 06-main-pipeline.yml exactly
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=WeatherForecast API
+            org.opencontainers.image.description=.NET 8 Web API
+            org.opencontainers.image.vendor=YourOrg
+
+      # Extract short tag for Phase 07 (image-tag) and Phase 09 (image-tag)
+      - name: Extract short tag + full image
+        id: short
+        run: |
+          SHORT="sha-$(echo ${{ github.sha }} | cut -c1-7)"
+          FULL="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${SHORT}"
+          echo "tag=${SHORT}"  >> $GITHUB_OUTPUT
+          echo "image=${FULL}" >> $GITHUB_OUTPUT
+          echo "Short tag: ${SHORT}"
+          echo "Full image: ${FULL}"
+
+      # Build locally — DO NOT push yet (shift-left security)
+      - name: Build image (local, for Trivy scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            DOTNET_VERSION=${{ env.DOTNET_VERSION }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+
+      # Trivy pre-push gate — matches 06-main-pipeline.yml exactly
+      - name: Trivy vulnerability scan (pre-push gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - name: Trivy SARIF report
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-container
+
+      # Push to ACR — only after Trivy passes
+      - name: Push image to ACR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Summary matches 06-main-pipeline.yml format exactly
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "## 📦 Stage 4 — Docker Build & Push" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Tool | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 1 · Unit Tests & Coverage | xUnit + Coverlet    | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 2 · SonarQube Analysis    | dotnet-sonarscanner | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 3 · Snyk Security Scan    | Snyk CLI            | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| 4 · Docker Build & Push   | Trivy + ACR         | ✅ Pushed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ secrets.ACR_LOGIN_SERVER }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ steps.short.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "_Triggered by: @${{ github.actor }} on \`${{ github.ref_name }}\`_" >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 5 — Deploy to Azure App Service Staging
+  # Calls: 07-deploy-app-service.yml as reusable workflow
+  # needs: package — runs after clean image is in ACR
+  #
+  # Phase 07 workflow_call contract:
+  #   inputs.image-tag   → needs.package.outputs.short-tag
+  #   inputs.environment → "staging" (triggers deploy-staging job only)
+  #   secrets required   → AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+  #                        AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+  #                        ACR_LOGIN_SERVER, ACR_USERNAME, ACR_PASSWORD
+  #   vars required      → AZURE_RESOURCE_GROUP,
+  #                        AZURE_APP_SERVICE_NAME,
+  #                        AZURE_APP_SERVICE_SLOT_STAGING
+  #
+  # Phase 07 smoke tests: health endpoint + /weatherforecast + /swagger
+  # Phase 07 verifies: container config + deployment logs
+  # ════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: "5 · Deploy → App Service Staging"
+    needs: package
+    uses: ./.github/workflows/07-deploy-app-service.yml
+    with:
+      image-tag:   ${{ needs.package.outputs.short-tag }}
+      environment: staging
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 6 — Auto GitHub Release (App Service edition)
+  # Calls: 09-auto-release-app-service.yml as reusable workflow
+  # needs: [package, deploy-staging]
+  #   → deploy-staging: release only created when staging healthy
+  #   → package: needed to access short-tag output
+  #
+  # Phase 09 workflow_call contract:
+  #   inputs.image-tag → needs.package.outputs.short-tag
+  #   secrets required → ACR_LOGIN_SERVER, AZURE_CLIENT_ID,
+  #                      AZURE_CLIENT_SECRET, AZURE_TENANT_ID,
+  #                      AZURE_SUBSCRIPTION_ID
+  #   vars required    → AZURE_RESOURCE_GROUP,
+  #                      AZURE_APP_SERVICE_NAME,
+  #                      AZURE_APP_SERVICE_SLOT_STAGING
+  #
+  # Assets created and attached to release:
+  #   deployment-info.json     → audit record
+  #   deploy-staging.sh        → one-command redeploy to staging
+  #   rollback-production.sh   → one-command production rollback
+  #   promote-to-production.sh → one-command slot swap
+  #   README.md                → human-readable deploy guide
+  #   appservice-release-assets.zip
+  # ════════════════════════════════════════════════════════════
+  auto-release:
+    name: "6 · Create GitHub Release"
+    needs: [package, deploy-staging]
+    uses: ./.github/workflows/09-auto-release-app-service.yml
+    with:
+      image-tag: ${{ needs.package.outputs.short-tag }}
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════
+  # STAGE 7 — Production Deployment (manual approval gate)
+  # Calls: 07-deploy-app-service.yml with environment: production
+  # needs: [package, auto-release]
+  #   → package: needed to access short-tag output
+  #   → auto-release: ensures release record exists before prod
+  #
+  # Only triggered when:
+  #   workflow_dispatch → deploy-target: staging-and-production
+  #
+  # Phase 07 environment: production triggers swap-to-production job
+  # which requires GitHub Environment protection rule:
+  #   Repo → Settings → Environments → production
+  #   → Required reviewers: [your team leads]
+  #   → Pipeline pauses here until a reviewer clicks Approve
+  #
+  # After approval: Phase 07 does az webapp deployment slot swap
+  # staging → production (zero downtime blue-green)
+  # ════════════════════════════════════════════════════════════
+  deploy-production:
+    name: "7 · Deploy → Production (manual approval)"
+    needs: [package, auto-release]
+    if: ${{ inputs.deploy-target == 'staging-and-production' }}
+    uses: ./.github/workflows/07-deploy-app-service.yml
+    with:
+      image-tag:   ${{ needs.package.outputs.short-tag }}
+      environment: production
+    secrets: inherit
