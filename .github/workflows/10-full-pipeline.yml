@@ -670,7 +670,7 @@ jobs:
   deploy-staging:
     name: "5 · Deploy → App Service Staging"
     needs: package
-    uses: ./.github/workflows/07-deploy-app-service.yml
+    uses: ./.github/workflows/07-app-service-deploy.yml
     with:
       image-tag:   ${{ needs.package.outputs.short-tag }}
       environment: staging
@@ -703,7 +703,7 @@ jobs:
   auto-release:
     name: "6 · Create GitHub Release"
     needs: [package, deploy-staging]
-    uses: ./.github/workflows/09-auto-release-app-service.yml
+    uses: ./.github/workflows/09-release.yml
     with:
       image-tag: ${{ needs.package.outputs.short-tag }}
     secrets: inherit
@@ -731,7 +731,7 @@ jobs:
     name: "7 · Deploy → Production (manual approval)"
     needs: [package, auto-release]
     if: ${{ inputs.deploy-target == 'staging-and-production' }}
-    uses: ./.github/workflows/07-deploy-app-service.yml
+    uses: ./.github/workflows/07-app-service-deploy.yml
     with:
       image-tag:   ${{ needs.package.outputs.short-tag }}
       environment: production
