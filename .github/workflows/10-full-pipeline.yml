@@ -33,7 +33,7 @@
 #   AZURE_APP_SERVICE_SLOT_STAGING
 # =============================================================
 
-name: "🚀 Full CI + CD Pipeline"
+name: "Phase 10 — 🚀 Full CI + CD Pipeline"
 
 on:
   push:

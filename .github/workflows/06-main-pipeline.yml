@@ -38,7 +38,7 @@ name: "🚀 Phase 6 — Main CI Pipeline"
 on:
   push:
     branches:
-      - master
+      - main
   workflow_dispatch:
     inputs:
       skip-sonar:
