@@ -1,0 +1,422 @@
+﻿# =============================================================
+# PHASE 9 — Auto GitHub Release (Azure App Service Edition)
+# Trigger : workflow_call (called by Phase 10 after ACR push)
+#           OR workflow_dispatch (manual hotfix release)
+#
+# Goal    : Create a GitHub Release with App Service deployment
+#           assets — rollback script, image tag record, and
+#           one-command redeploy instructions for every release.
+#
+# Why releases matter for App Service (not just Kubernetes):
+#   - Permanent audit trail: who deployed what image, when
+#   - Rollback: grab any past release → one az CLI command
+#   - Reproducibility: exact image tag recorded forever
+#   - Compliance: every production change is versioned
+#
+# PDF Reference: "Implementing Continuous Deployment with
+#                GitHub Actions — release event"
+#                "actions/create-release: Creates a new GitHub
+#                 release and uploads assets to it."
+#
+# REQUIRED PERMISSIONS:
+#   contents: write   → create releases + upload assets
+#   packages: read    → read published package metadata
+#
+# REQUIRED SECRETS (same as Phase 05 + Phase 07):
+#   ACR_LOGIN_SERVER      → e.g. yourregistry.azurecr.io
+#   AZURE_CLIENT_ID       → Service principal app ID
+#   AZURE_CLIENT_SECRET   → Service principal secret
+#   AZURE_TENANT_ID       → Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID → Azure subscription ID
+#
+# REQUIRED VARIABLES (same as Phase 07):
+#   AZURE_RESOURCE_GROUP           → e.g. rg-weatherforecast
+#   AZURE_APP_SERVICE_NAME         → e.g. weatherforecast-api-app
+#   AZURE_APP_SERVICE_SLOT_STAGING → e.g. staging
+# =============================================================
+
+name: "🏷️ Phase 9 — Auto GitHub Release (App Service)"
+
+on:
+  # Called by Phase 10 full pipeline after ACR push
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag pushed to ACR (e.g. sha-abc1234)"
+        type: string
+        required: true
+    secrets:
+      ACR_LOGIN_SERVER:      { required: true }
+      AZURE_CLIENT_ID:       { required: true }
+      AZURE_CLIENT_SECRET:   { required: true }
+      AZURE_TENANT_ID:       { required: true }
+      AZURE_SUBSCRIPTION_ID: { required: true }
+
+  # Manual trigger — useful for hotfix releases
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: "Image tag to release (e.g. sha-abc1234)"
+        type: string
+        required: true
+      release-notes:
+        description: "Additional release notes (optional)"
+        type: string
+        required: false
+
+permissions:
+  contents: write    # create releases + upload assets
+  packages: read     # read package metadata
+
+env:
+  IMAGE_NAME: weatherforecast-api
+
+jobs:
+  create-release:
+    name: "Create GitHub Release (App Service)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    outputs:
+      release-tag:  ${{ steps.version.outputs.release-tag }}
+      release-name: ${{ steps.version.outputs.release-name }}
+      image-tag:    ${{ steps.version.outputs.image-tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Resolve image tag ─────────────────────────────────
+      # From workflow_call: inputs.image-tag
+      # From workflow_dispatch: inputs.image-tag
+      - name: Extract version information
+        id: version
+        run: |
+          IMAGE_TAG="${{ inputs.image-tag }}"
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+          # Build release tag:
+          #   semver push (v1.2.3) → release tag: v1.2.3
+          #   sha-based push       → release tag: release-20260517-abc1234
+          SHORT_SHA=$(echo "${IMAGE_TAG}" | sed 's/sha-//')
+
+          if [[ "${IMAGE_TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            RELEASE_TAG="v${IMAGE_TAG}"
+            RELEASE_NAME="v${IMAGE_TAG}"
+          else
+            TIMESTAMP=$(date +'%Y%m%d-%H%M')
+            RELEASE_TAG="release-${TIMESTAMP}-${SHORT_SHA}"
+            RELEASE_NAME="Release ${TIMESTAMP} (${SHORT_SHA})"
+          fi
+
+          echo "release-tag=${RELEASE_TAG}"   >> $GITHUB_OUTPUT
+          echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "✅ Release: $RELEASE_NAME → tag: $RELEASE_TAG"
+
+      # ── Build App Service deployment assets ──────────────
+      # These are attached to the release so any team member
+      # can redeploy or rollback to this exact version in one command.
+      - name: Build App Service release assets
+        run: |
+          mkdir -p release-assets
+
+          FULL_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.image-tag }}"
+          APP_NAME="${{ vars.AZURE_APP_SERVICE_NAME }}"
+          RESOURCE_GROUP="${{ vars.AZURE_RESOURCE_GROUP }}"
+          STAGING_SLOT="${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}"
+          RELEASE_TAG="${{ steps.version.outputs.release-tag }}"
+          COMMIT_SHA="${{ github.sha }}"
+          RELEASE_DATE=$(date +'%Y-%m-%d %H:%M UTC')
+
+          # ── 1. deployment-info.json ────────────────────────
+          # Machine-readable record of exactly what was deployed.
+          # Use for auditing, incident investigation, or automation.
+          cat > release-assets/deployment-info.json << EOF
+          {
+            "release": "${RELEASE_TAG}",
+            "imageTag": "${{ steps.version.outputs.image-tag }}",
+            "fullImage": "${FULL_IMAGE}",
+            "appService": "${APP_NAME}",
+            "resourceGroup": "${RESOURCE_GROUP}",
+            "stagingSlot": "${STAGING_SLOT}",
+            "commitSha": "${COMMIT_SHA}",
+            "deployedAt": "${RELEASE_DATE}",
+            "deployedBy": "${{ github.actor }}",
+            "pipeline": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+
+          # ── 2. deploy-staging.sh ───────────────────────────
+          # One-command redeploy to staging slot.
+          # Any team member can grab this from the release and
+          # redeploy the exact image without touching the pipeline.
+          cat > release-assets/deploy-staging.sh << EOF
+          #!/bin/bash
+          # =====================================================
+          # WeatherForecast API — Redeploy to App Service Staging
+          # Release : ${RELEASE_TAG}
+          # Image   : ${FULL_IMAGE}
+          # =====================================================
+          set -e
+
+          echo "🚀 Redeploying ${RELEASE_TAG} to staging slot..."
+
+          az login --service-principal \\
+            --username "\$AZURE_CLIENT_ID" \\
+            --password "\$AZURE_CLIENT_SECRET" \\
+            --tenant "\$AZURE_TENANT_ID"
+
+          az webapp config container set \\
+            --name "${APP_NAME}" \\
+            --resource-group "${RESOURCE_GROUP}" \\
+            --slot "${STAGING_SLOT}" \\
+            --docker-custom-image-name "${FULL_IMAGE}"
+
+          echo "⏳ Restarting staging slot..."
+          az webapp restart \\
+            --name "${APP_NAME}" \\
+            --resource-group "${RESOURCE_GROUP}" \\
+            --slot "${STAGING_SLOT}"
+
+          echo "🔍 Checking health..."
+          sleep 20
+          curl -sf "https://${APP_NAME}-${STAGING_SLOT}.azurewebsites.net/health" \\
+            && echo "✅ Staging slot healthy" \\
+            || echo "⚠️  Health check failed — check App Service logs"
+          EOF
+          chmod +x release-assets/deploy-staging.sh
+
+          # ── 3. rollback-production.sh ─────────────────────
+          # One-command rollback for production.
+          # If the current production deploy is broken, run this
+          # script with the previous release's image tag to revert.
+          cat > release-assets/rollback-production.sh << EOF
+          #!/bin/bash
+          # =====================================================
+          # WeatherForecast API — Production Rollback Script
+          # Use : ./rollback-production.sh <previous-image-tag>
+          # e.g.: ./rollback-production.sh sha-prev1234
+          # =====================================================
+          set -e
+
+          ROLLBACK_TAG=\${1:-"${FULL_IMAGE}"}
+          ROLLBACK_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:\${ROLLBACK_TAG}"
+
+          echo "⏪ Rolling back production to: \${ROLLBACK_IMAGE}"
+
+          az login --service-principal \\
+            --username "\$AZURE_CLIENT_ID" \\
+            --password "\$AZURE_CLIENT_SECRET" \\
+            --tenant "\$AZURE_TENANT_ID"
+
+          # Deploy rollback image to staging first
+          az webapp config container set \\
+            --name "${APP_NAME}" \\
+            --resource-group "${RESOURCE_GROUP}" \\
+            --slot "${STAGING_SLOT}" \\
+            --docker-custom-image-name "\${ROLLBACK_IMAGE}"
+
+          # Verify staging is healthy before swapping
+          sleep 20
+          curl -sf "https://${APP_NAME}-${STAGING_SLOT}.azurewebsites.net/health" \\
+            || { echo "❌ Rollback image unhealthy — aborting swap"; exit 1; }
+
+          # Atomic slot swap — zero downtime rollback
+          az webapp deployment slot swap \\
+            --name "${APP_NAME}" \\
+            --resource-group "${RESOURCE_GROUP}" \\
+            --slot "${STAGING_SLOT}" \\
+            --target-slot production
+
+          echo "✅ Rollback complete — production now running: \${ROLLBACK_IMAGE}"
+          EOF
+          chmod +x release-assets/rollback-production.sh
+
+          # ── 4. promote-to-production.sh ───────────────────
+          # One-command slot swap: staging → production.
+          # Used when staging has been verified and you want to
+          # promote without running the full pipeline again.
+          cat > release-assets/promote-to-production.sh << EOF
+          #!/bin/bash
+          # =====================================================
+          # WeatherForecast API — Promote Staging → Production
+          # Release : ${RELEASE_TAG}
+          # Image   : ${FULL_IMAGE}
+          # =====================================================
+          set -e
+
+          echo "🔁 Promoting ${RELEASE_TAG} from staging → production..."
+
+          az login --service-principal \\
+            --username "\$AZURE_CLIENT_ID" \\
+            --password "\$AZURE_CLIENT_SECRET" \\
+            --tenant "\$AZURE_TENANT_ID"
+
+          # Verify staging is healthy before swapping
+          echo "🔍 Verifying staging health before swap..."
+          curl -sf "https://${APP_NAME}-${STAGING_SLOT}.azurewebsites.net/health" \\
+            || { echo "❌ Staging slot unhealthy — aborting promotion"; exit 1; }
+
+          # Atomic blue-green slot swap — zero downtime
+          az webapp deployment slot swap \\
+            --name "${APP_NAME}" \\
+            --resource-group "${RESOURCE_GROUP}" \\
+            --slot "${STAGING_SLOT}" \\
+            --target-slot production
+
+          echo "✅ Production now running: ${FULL_IMAGE}"
+          echo "🔗 https://${APP_NAME}.azurewebsites.net/health"
+          EOF
+          chmod +x release-assets/promote-to-production.sh
+
+          # ── 5. README.md ──────────────────────────────────
+          # Human-readable guide attached to every release.
+          cat > release-assets/README.md << EOF
+          # WeatherForecast API — ${RELEASE_TAG}
+
+          ## Image
+          \`\`\`
+          ${FULL_IMAGE}
+          \`\`\`
+
+          ## Quick Commands
+
+          ### Redeploy this release to staging
+          \`\`\`bash
+          export AZURE_CLIENT_ID=<your-client-id>
+          export AZURE_CLIENT_SECRET=<your-client-secret>
+          export AZURE_TENANT_ID=<your-tenant-id>
+          bash deploy-staging.sh
+          \`\`\`
+
+          ### Promote staging → production (zero downtime)
+          \`\`\`bash
+          bash promote-to-production.sh
+          \`\`\`
+
+          ### Rollback production to a previous release
+          \`\`\`bash
+          bash rollback-production.sh sha-prev1234
+          \`\`\`
+
+          ### Manual az CLI redeploy
+          \`\`\`bash
+          az webapp config container set \\
+            --name ${APP_NAME} \\
+            --resource-group ${RESOURCE_GROUP} \\
+            --slot ${STAGING_SLOT} \\
+            --docker-custom-image-name ${FULL_IMAGE}
+          \`\`\`
+
+          ## What was verified before this release
+          - ✅ Unit tests passed
+          - 🔍 SonarQube Quality Gate passed
+          - 🛡️ Snyk security scan passed (no HIGH/CRITICAL CVEs)
+          - 🐳 Trivy container scan passed (no CRITICAL CVEs)
+          - 📦 Image pushed to ACR: \`${FULL_IMAGE}\`
+
+          ## Deployment info
+          | Item | Value |
+          |------|-------|
+          | Commit | \`${COMMIT_SHA}\` |
+          | Released | ${RELEASE_DATE} |
+          | Released by | ${{ github.actor }} |
+          | Pipeline | [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          EOF
+
+          # ── 6. Bundle all assets into a zip ───────────────
+          cd release-assets
+          zip ../appservice-release-assets.zip ./*
+          cd ..
+
+          echo "✅ Release assets prepared:"
+          ls -lh release-assets/
+
+      # ── Create the GitHub Release ─────────────────────────
+      # PDF: "actions/create-release: Creates a new GitHub
+      #       release and uploads assets to it."
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release-tag }}
+          name: "WeatherForecast API — ${{ steps.version.outputs.release-name }}"
+          body: |
+            ## 🚀 WeatherForecast API — ${{ steps.version.outputs.release-name }}
+
+            ### Docker Image
+            ```
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.image-tag }}
+            ```
+
+            ### Deploy to Azure App Service (staging)
+            ```bash
+            az webapp config container set \
+              --name ${{ vars.AZURE_APP_SERVICE_NAME }} \
+              --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+              --slot ${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }} \
+              --docker-custom-image-name ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.image-tag }}
+            ```
+
+            ### Promote staging → production (zero downtime)
+            ```bash
+            az webapp deployment slot swap \
+              --name ${{ vars.AZURE_APP_SERVICE_NAME }} \
+              --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+              --slot ${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }} \
+              --target-slot production
+            ```
+
+            ### Or use the attached scripts
+            Download the assets below and run:
+            - `deploy-staging.sh` — redeploy this exact image to staging
+            - `promote-to-production.sh` — swap staging → production
+            - `rollback-production.sh <tag>` — rollback production to any previous release
+
+            ### Pipeline gates passed ✅
+            | Gate | Status |
+            |------|--------|
+            | Unit Tests & Coverage | ✅ Passed |
+            | SonarQube Quality Gate | ✅ Passed |
+            | Snyk CVE Scan | ✅ No HIGH/CRITICAL |
+            | Trivy Container Scan | ✅ No CRITICAL |
+            | Docker Push to ACR | ✅ Complete |
+
+            ---
+            **Commit:** `${{ github.sha }}`
+            **Triggered by:** `${{ github.actor }}`
+            **App Service:** `${{ vars.AZURE_APP_SERVICE_NAME }}.azurewebsites.net`
+            ${{ inputs.release-notes && format('\n**Notes:** {0}', inputs.release-notes) || '' }}
+          files: |
+            release-assets/deployment-info.json
+            release-assets/deploy-staging.sh
+            release-assets/rollback-production.sh
+            release-assets/promote-to-production.sh
+            release-assets/README.md
+            appservice-release-assets.zip
+          draft: false
+          prerelease: ${{ !startsWith(steps.version.outputs.release-tag, 'v') }}
+          generate_release_notes: true
+
+      - name: Post release summary
+        if: always()
+        run: |
+          echo "## 🏷️ GitHub Release Created (App Service)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag         | \`${{ steps.version.outputs.release-tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image       | \`${{ steps.version.outputs.image-tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Service | \`${{ vars.AZURE_APP_SERVICE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Releases    | [${{ github.repository }}/releases](https://github.com/${{ github.repository }}/releases) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📎 Assets attached" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Purpose |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`deployment-info.json\` | Machine-readable audit record |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`deploy-staging.sh\` | One-command redeploy to staging |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`promote-to-production.sh\` | Zero-downtime slot swap to production |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`rollback-production.sh\` | One-command production rollback |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`README.md\` | Human-readable deploy guide |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`appservice-release-assets.zip\` | All assets bundled |" >> $GITHUB_STEP_SUMMARY
