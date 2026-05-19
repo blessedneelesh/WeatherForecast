@@ -41,5 +41,11 @@ namespace WebApplication1.Controllers
         {
             return a - b;
         }
+
+        [HttpGet("multiply", Name = "MultiplyNumbers")]
+        public int Multiply(int a, int b)
+        {
+            return a * b;
+        }
     }
 }
