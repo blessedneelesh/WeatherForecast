@@ -236,7 +236,7 @@ jobs:
             ${{ runner.os }}-sonar-
 
       - name: Install SonarQube scanner
-        run: dotenv -f .env.dev dotnet tool install --global dotnet-sonarscanner
+        run: dotnet tool install --global dotnet-sonarscanner
 
       - name: Restore dependencies
         run: dotnet restore
