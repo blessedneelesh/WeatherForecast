@@ -703,6 +703,8 @@ jobs:
   auto-release:
     name: "6 · Create GitHub Release"
     needs: [package, deploy-staging]
+    permissions:
+      contents: write    # Required by 09-release.yml to create releases
     uses: ./.github/workflows/09-release.yml
     with:
       image-tag: ${{ needs.package.outputs.short-tag }}
