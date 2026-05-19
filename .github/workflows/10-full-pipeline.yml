@@ -705,6 +705,7 @@ jobs:
     needs: [package, deploy-staging]
     permissions:
       contents: write    # Required by 09-release.yml to create releases
+      packages: read     # Required by 09-release.yml to access container registry metadata
     uses: ./.github/workflows/09-release.yml
     with:
       image-tag: ${{ needs.package.outputs.short-tag }}
