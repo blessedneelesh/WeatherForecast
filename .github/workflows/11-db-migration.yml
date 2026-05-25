@@ -101,6 +101,7 @@ jobs:
         id: run-migrations
         env:
           PGPASSWORD: ${{ steps.secrets.outputs.pg_pass }}
+          PGSSLMODE: require
         run: |
           DB="${{ steps.config.outputs.pg_database }}"
           echo "▶ Migrating [${{ inputs.environment }}] → ${{ vars.PG_HOST }}/$DB"
