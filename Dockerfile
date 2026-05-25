@@ -16,9 +16,9 @@ WORKDIR /src
 
 # Copy only project files first — this layer is cached until
 # any .csproj changes, giving fast rebuilds for code-only changes
-COPY ["WebApplication1/WebApplication1.csproj", "WebApplication1/"]
+COPY ["WeatherForecastApi/WeatherForecastApi.csproj", "WeatherForecastApi/"]
 
-RUN dotnet restore "WebApplication1/WebApplication1.csproj" \
+RUN dotnet restore "WeatherForecastApi/WeatherForecastApi.csproj" \
     --runtime linux-x64
 
 # ── Stage 2: Build + Publish ─────────────────────────────────
@@ -26,13 +26,13 @@ FROM restore AS build
 
 # Copy all source after packages are restored
 COPY . .
-WORKDIR "/src/WebApplication1"
+WORKDIR "/src/WeatherForecastApi"
 
-RUN dotnet build "WebApplication1.csproj" -c Release -o /app/build
+RUN dotnet build "WeatherForecastApi.csproj" -c Release -o /app/build
 
 # Publish stage
 FROM build AS publish
-RUN dotnet publish "WebApplication1.csproj" \
+RUN dotnet publish "WeatherForecastApi.csproj" \
     -c Release \
     -o /app/publish \
     /p:UseAppHost=false
