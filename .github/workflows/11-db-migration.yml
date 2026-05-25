@@ -1,0 +1,141 @@
+﻿# .github/workflows/11-db-migration.yml
+name: "🗄️ Phase 11 — Database Migration"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target: dev, staging or production"
+        type: string
+        required: true
+        default: dev
+    outputs:
+      migration-status:
+        value: ${{ jobs.migrate.outputs.status }}
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_CLIENT_SECRET:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target: dev, staging or production"
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+        default: dev
+
+jobs:
+  migrate:
+    name: "Run Migrations (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      status: ${{ steps.run-migrations.outputs.status }}
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Azure Login ─────────────────────────────────────────────────────
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      # ── 3. Resolve DB name + Key Vault secret name from environment input ──
+      - name: Resolve environment config
+        id: config
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "pg_database=${{ vars.PG_DATABASE_PRODUCTION }}"                   >> $GITHUB_OUTPUT
+            echo "secret_name=${{ vars.DB_PASSWORD_SECRET_NAME_PRODUCTION }}"       >> $GITHUB_OUTPUT
+          elif [ "${{ inputs.environment }}" = "staging" ]; then
+            echo "pg_database=${{ vars.PG_DATABASE_STAGING }}"                      >> $GITHUB_OUTPUT
+            echo "secret_name=${{ vars.DB_PASSWORD_SECRET_NAME_STAGING }}"          >> $GITHUB_OUTPUT
+          else
+            echo "pg_database=${{ vars.PG_DATABASE_DEV }}"                          >> $GITHUB_OUTPUT
+            echo "secret_name=${{ vars.DB_PASSWORD_SECRET_NAME_DEV }}"              >> $GITHUB_OUTPUT
+          fi
+
+      # ── 4. Fetch DB password from Key Vault (never stored in GitHub) ───────
+      - name: Fetch DB password from Key Vault
+        id: secrets
+        run: |
+          # Strip URI to get vault name: https://wf-keyvault-1234.vault.azure.net/ → wf-keyvault-1234
+          KV_NAME=$(echo "${{ vars.KEY_VAULT_URI }}" \
+            | sed 's|https://||;s|.vault.azure.net/||')
+
+          PG_PASS=$(az keyvault secret show \
+            --vault-name "$KV_NAME" \
+            --name "${{ steps.config.outputs.secret_name }}" \
+            --query value -o tsv)
+
+          # Mask immediately — shows as *** in all subsequent log lines
+          echo "::add-mask::$PG_PASS"
+          echo "pg_pass=$PG_PASS" >> $GITHUB_OUTPUT
+
+      # ── 5. Install psql client ─────────────────────────────────────────────
+      - name: Install psql client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      # ── 6. Run all SQL migration scripts in sorted order ───────────────────
+      - name: Run SQL migrations (${{ inputs.environment }})
+        id: run-migrations
+        env:
+          PGPASSWORD: ${{ steps.secrets.outputs.pg_pass }}
+        run: |
+          DB="${{ steps.config.outputs.pg_database }}"
+          echo "▶ Migrating [${{ inputs.environment }}] → ${{ vars.PG_HOST }}/$DB"
+          echo "────────────────────────────────────────"
+
+          for script in $(ls migrations/*.sql | sort); do
+            echo "→ Applying: $script"
+            psql \
+              --host="${{ vars.PG_HOST }}" \
+              --username="${{ vars.PG_ADMIN_USER }}" \
+              --dbname="$DB" \
+              --set ON_ERROR_STOP=1 \
+              --file="$script"
+            echo "✅ Done: $script"
+            echo "────────────────────────────────────────"
+          done
+
+          echo "status=passed" >> $GITHUB_OUTPUT
+
+      # ── 7. Post migration summary (always runs, even on failure) ───────────
+      - name: Post migration summary
+        if: always()
+        run: |
+          S="${{ steps.run-migrations.outputs.status }}"
+
+          echo "## 🗄️ DB Migration — ${{ inputs.environment }}"        >> $GITHUB_STEP_SUMMARY
+          echo ""                                                        >> $GITHUB_STEP_SUMMARY
+          echo "| Item     | Value |"                                   >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|"                                   >> $GITHUB_STEP_SUMMARY
+          echo "| Env      | \`${{ inputs.environment }}\` |"          >> $GITHUB_STEP_SUMMARY
+          echo "| Database | \`${{ steps.config.outputs.pg_database }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Host     | \`${{ vars.PG_HOST }}\` |"                >> $GITHUB_STEP_SUMMARY
+
+          if [ "$S" = "passed" ]; then
+            echo "| Status   | ✅ All migrations succeeded |"          >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status   | ❌ FAILED — app deploy blocked |"       >> $GITHUB_STEP_SUMMARY
+          fi
