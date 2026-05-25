@@ -15,10 +15,15 @@ FROM mcr.microsoft.com/dotnet/sdk:8.0 AS restore
 WORKDIR /src
 
 # Copy only project files first — this layer is cached until
-# any .csproj changes, giving fast rebuilds for code-only changes
-COPY ["WeatherForecastApi/WeatherForecastApi.csproj", "WeatherForecastApi/"]
+# any .csproj changes, giving fast rebuilds for code-only changes           
+COPY ["WeatherForecastApi.PeerApplication/WeatherForecastApi.PeerApplication.csproj", "WeatherForecastApi.PeerApplication/"]
+COPY ["WeatherForecastApi.Common/WeatherForecastApi.Common.csproj", "WeatherForecastApi.Common/"]
+COPY ["WeatherForecastApi.Repository/WeatherForecastApi.Repository.csproj", "WeatherForecastApi.Repository/"]
+COPY ["WeatherForecastApi.Services/WeatherForecastApi.Services.csproj", "WeatherForecastApi.Services/"]
+COPY ["WeatherForecastApi.Services.Abstractions/WeatherForecastApi.Services.Abstractions.csproj", "WeatherForecastApi.Services.Abstractions/"]
+COPY ["WeatherForecastApi.Peer/WeatherForecastApi.Peer.csproj", "WeatherForecastApi.Peer/"]
 
-RUN dotnet restore "WeatherForecastApi/WeatherForecastApi.csproj" \
+RUN dotnet restore "WeatherForecastApi.PeerApplication/WeatherForecastApi.PeerApplication.csproj" \
     --runtime linux-x64
 
 # ── Stage 2: Build + Publish ─────────────────────────────────
@@ -26,13 +31,13 @@ FROM restore AS build
 
 # Copy all source after packages are restored
 COPY . .
-WORKDIR "/src/WeatherForecastApi"
+WORKDIR "/src/WeatherForecastApi.PeerApplication"
 
-RUN dotnet build "WeatherForecastApi.csproj" -c Release -o /app/build
+RUN dotnet build "WeatherForecastApi.PeerApplication.csproj" -c Release -o /app/build
 
 # Publish stage
 FROM build AS publish
-RUN dotnet publish "WeatherForecastApi.csproj" \
+RUN dotnet publish "WeatherForecastApi.PeerApplication.csproj" \
     -c Release \
     -o /app/publish \
     /p:UseAppHost=false
@@ -71,4 +76,4 @@ USER appuser
 
 # Copy published output from publish stage
 COPY --from=publish /app/publish .
-ENTRYPOINT ["dotnet", "WebApplication1.dll"]
+ENTRYPOINT ["dotnet", "WeatherForecastApi.PeerApplication.dll"]
