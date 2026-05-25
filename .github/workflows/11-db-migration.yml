@@ -81,10 +81,19 @@ jobs:
           KV_NAME=$(echo "${{ vars.KEY_VAULT_URI }}" \
             | sed 's|https://||;s|.vault.azure.net/||')
 
-          PG_PASS=$(az keyvault secret show \
+                    # Fetch raw secret value from Key Vault
+          # Secret is stored as JSON: {"username":"appadmin","password":"<actual-password>"}
+          RAW_SECRET=$(az keyvault secret show \
             --vault-name "$KV_NAME" \
             --name "${{ steps.config.outputs.secret_name }}" \
             --query value -o tsv)
+ 
+          # Parse JSON to extract the password field only
+          PG_PASS=$(echo "$RAW_SECRET" | python3 -c "
+          import sys, json
+          secret = json.load(sys.stdin)
+          print(secret['password'])
+          ")
 
           # Mask immediately — shows as *** in all subsequent log lines
           echo "::add-mask::$PG_PASS"
