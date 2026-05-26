@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.OpenApi.Models;
 using WeatherForecastApi.Common.Model;
 using WeatherForecastApi.Common.SecretManager;
@@ -63,6 +64,9 @@ builder.Services.AddWeatherForecastServices();
 builder.Services.AddControllers()
     .AddApplicationPart(typeof(WeatherForecastApi.Peer.Controllers.WeatherForecastsController).Assembly);
 
+builder.Services.AddHealthChecks()
+    .AddCheck("self", () => HealthCheckResult.Healthy());
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
 {
@@ -85,6 +89,7 @@ app.UseMiddleware<WeatherForecastNotFoundExceptionMiddleware>();
 
 app.UseHttpsRedirection();
 app.UseAuthorization();
+app.MapHealthChecks("/health");
 app.MapControllers();
 
 app.Run();
