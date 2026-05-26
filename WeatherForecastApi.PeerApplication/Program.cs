@@ -84,12 +84,20 @@ if (app.Environment.IsDevelopment() || app.Environment.IsStaging())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+// Health check endpoint mapped BEFORE HTTPS redirection
+// This ensures it responds to both HTTP and HTTPS
+app.MapHealthChecks("/health");
+
+// Only redirect to HTTPS in production/staging, not for health checks
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 
 app.UseMiddleware<WeatherForecastNotFoundExceptionMiddleware>();
 
 app.UseHttpsRedirection();
 app.UseAuthorization();
-app.MapHealthChecks("/health");
 app.MapControllers();
 
 app.Run();
