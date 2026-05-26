@@ -64,6 +64,26 @@ builder.Services.AddWeatherForecastServices();
 builder.Services.AddControllers()
     .AddApplicationPart(typeof(WeatherForecastApi.Peer.Controllers.WeatherForecastsController).Assembly);
 
+if (builder.Environment.IsDevelopment())
+{
+    var allowedOrigins = builder.Configuration
+        .GetSection("Cors:AllowedOrigins")
+        .Get<string[]>() ?? Array.Empty<string>();
+
+    builder.Services.AddCors(options =>
+    {
+        options.AddDefaultPolicy(policy =>
+        {
+            if (allowedOrigins.Length > 0)
+            {
+                policy.WithOrigins(allowedOrigins)
+                      .AllowAnyHeader()
+                      .AllowAnyMethod();
+            }
+        });
+    });
+}
+
 builder.Services.AddHealthChecks()
     .AddCheck("self", () => HealthCheckResult.Healthy());
 
@@ -88,6 +108,12 @@ if (app.Environment.IsDevelopment() || app.Environment.IsStaging())
 app.UseMiddleware<WeatherForecastNotFoundExceptionMiddleware>();
 
 app.UseHttpsRedirection();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseCors();
+}
+
 app.UseAuthorization();
 app.MapHealthChecks("/health");
 app.MapControllers();
