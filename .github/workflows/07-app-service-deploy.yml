@@ -21,8 +21,8 @@
 #   AZURE_RESOURCE_GROUP    → e.g. rg-weatherforecast
 #   AZURE_APP_SERVICE_NAME  → e.g. weatherforecast-api-app
 #   AZURE_APP_SERVICE_SLOT_STAGING → e.g. staging
-#   AZURE_KEY_VAULT_URI     → e.g. https://my-vault.vault.azure.net/
-#   AZURE_KEY_VAULT_DB_SECRET_NAME → e.g. weatherforecast-staging-database
+#   KEY_VAULT_URI           → e.g. https://my-vault.vault.azure.net/
+#   DB_PASSWORD_SECRET_NAME_STAGING → e.g. weatherforecast-staging-database
 #
 # REQUIRED PERMISSIONS:
 #   Service Principal must have "Contributor" or "Website Contributor"
@@ -111,11 +111,11 @@ jobs:
       # Set ASPNETCORE environment variables on the staging slot
       - name: Configure App Service environment variables
         run: |
-          KEY_VAULT_URI="${{ vars.AZURE_KEY_VAULT_URI }}"
-          DB_SECRET_NAME="${{ vars.AZURE_KEY_VAULT_DB_SECRET_NAME || 'weatherforecast-staging-database' }}"
+          KEY_VAULT_URI="${{ vars.KEY_VAULT_URI }}"
+          DB_SECRET_NAME="${{ vars.DB_PASSWORD_SECRET_NAME_STAGING || 'weatherforecast-staging-database' }}"
 
           if [ -z "$KEY_VAULT_URI" ]; then
-            echo "::error::Missing repository/environment variable AZURE_KEY_VAULT_URI."
+            echo "::error::Missing repository/environment variable KEY_VAULT_URI."
             exit 1
           fi
 
