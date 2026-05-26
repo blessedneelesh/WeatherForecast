@@ -21,6 +21,8 @@
 #   AZURE_RESOURCE_GROUP    → e.g. rg-weatherforecast
 #   AZURE_APP_SERVICE_NAME  → e.g. weatherforecast-api-app
 #   AZURE_APP_SERVICE_SLOT_STAGING → e.g. staging
+#   AZURE_KEY_VAULT_URI     → e.g. https://my-vault.vault.azure.net/
+#   AZURE_KEY_VAULT_DB_SECRET_NAME → e.g. weatherforecast-staging-database
 #
 # REQUIRED PERMISSIONS:
 #   Service Principal must have "Contributor" or "Website Contributor"
@@ -109,6 +111,14 @@ jobs:
       # Set ASPNETCORE environment variables on the staging slot
       - name: Configure App Service environment variables
         run: |
+          KEY_VAULT_URI="${{ vars.AZURE_KEY_VAULT_URI }}"
+          DB_SECRET_NAME="${{ vars.AZURE_KEY_VAULT_DB_SECRET_NAME || 'weatherforecast-staging-database' }}"
+
+          if [ -z "$KEY_VAULT_URI" ]; then
+            echo "::error::Missing repository/environment variable AZURE_KEY_VAULT_URI."
+            exit 1
+          fi
+
           az webapp config appsettings set \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
@@ -118,7 +128,12 @@ jobs:
               ASPNETCORE_URLS="http://+:8080" \
               ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
               WEBSITES_PORT=8080 \
-              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false
+              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false \
+              KeyVault__VaultUri="$KEY_VAULT_URI" \
+              KeyVault__DbSecretName="$DB_SECRET_NAME" \
+              AZURE_CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}" \
+              AZURE_CLIENT_SECRET="${{ secrets.AZURE_CLIENT_SECRET }}" \
+              AZURE_TENANT_ID="${{ secrets.AZURE_TENANT_ID }}"
 
       # PDF: "use azure/webapps-deploy to deploy your application
       #       to Azure App Service"
@@ -164,6 +179,16 @@ jobs:
           echo "::error::Staging slot did not become healthy after 150 seconds."
           exit 1
 
+      - name: Download App Service logs on health check failure
+        if: failure()
+        run: |
+          mkdir -p appservice-logs
+          az webapp log download \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --log-file       appservice-logs/staging.zip || true
+
       # Basic smoke test against staging slot
       - name: Smoke test staging slot
         run: |
@@ -175,7 +200,7 @@ jobs:
           [ "$STATUS" = "200" ] || (echo "::error::Health check failed: HTTP $STATUS" && exit 1)
 
           # Test WeatherForecast API endpoint
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/weatherforecast")
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/WeatherForecasts")
           [ "$STATUS" = "200" ] || echo "Warning: WeatherForecast endpoint returned HTTP $STATUS"
 
           # Test API root / swagger endpoint
