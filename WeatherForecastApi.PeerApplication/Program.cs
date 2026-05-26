@@ -79,29 +79,17 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
-//if (app.Environment.IsDevelopment() || app.Environment.IsStaging())
-//{
-//    app.UseSwagger();
-//    app.UseSwaggerUI();
-//}
-
-// Enable Swagger in all environments for Azure App Service testing
-app.UseSwagger();
-app.UseSwaggerUI();
-// Health check endpoint mapped BEFORE HTTPS redirection
-// This ensures it responds to both HTTP and HTTPS
-//app.MapHealthChecks("/health");
-
-// Only redirect to HTTPS in production/staging, not for health checks
-if (!app.Environment.IsDevelopment())
+if (app.Environment.IsDevelopment() || app.Environment.IsStaging())
 {
-    app.UseHttpsRedirection();
+    app.UseSwagger();
+    app.UseSwaggerUI();
 }
 
 app.UseMiddleware<WeatherForecastNotFoundExceptionMiddleware>();
 
 app.UseHttpsRedirection();
 app.UseAuthorization();
+app.MapHealthChecks("/health");
 app.MapControllers();
 
 app.Run();
