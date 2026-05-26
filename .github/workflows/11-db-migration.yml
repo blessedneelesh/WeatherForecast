@@ -88,7 +88,13 @@ jobs:
             --name "${{ steps.config.outputs.secret_name }}" \
             --query value -o tsv)
  
-          # Parse JSON to extract the password field only
+          # Parse JSON to extract the username and password fields
+          PG_USER=$(echo "$RAW_SECRET" | python3 -c "
+          import sys, json
+          secret = json.load(sys.stdin)
+          print(secret['username'])
+          ")
+
           PG_PASS=$(echo "$RAW_SECRET" | python3 -c "
           import sys, json
           secret = json.load(sys.stdin)
@@ -96,7 +102,9 @@ jobs:
           ")
 
           # Mask immediately — shows as *** in all subsequent log lines
+          echo "::add-mask::$PG_USER"
           echo "::add-mask::$PG_PASS"
+          echo "pg_user=$PG_USER" >> $GITHUB_OUTPUT
           echo "pg_pass=$PG_PASS" >> $GITHUB_OUTPUT
 
       # ── 5. Install psql client ─────────────────────────────────────────────
@@ -120,7 +128,7 @@ jobs:
             echo "→ Applying: $script"
             psql \
               --host="${{ vars.PG_HOST }}" \
-              --username="${{ vars.PG_ADMIN_USER }}" \
+              --username="${{ steps.secrets.outputs.pg_user }}" \
               --dbname="$DB" \
               --set ON_ERROR_STOP=1 \
               --file="$script"
