@@ -1,0 +1,238 @@
+﻿# =============================================================
+# PHASE 12 — Production Rollback (Blue-Green Swap Back)
+# Trigger  : workflow_dispatch (manual only — never automatic)
+# Goal     : Instantly restore production to the previous version
+#            by swapping staging slot back to production.
+#
+# How it works:
+#   After a normal deployment the slots look like this:
+#     Production slot → v1.1 (current live version)
+#     Staging slot    → v1.0 (previous version sitting here)
+#
+#   This workflow swaps them back:
+#     Production slot → v1.0 (previous version restored ✅)
+#     Staging slot    → v1.1 (bad version sitting here safely)
+#
+# ⚠️  IMPORTANT:
+#   This only works if the previous version is still in the
+#   staging slot. If another deployment has run since the bad
+#   swap, use a manual redeploy with a specific image tag instead.
+#
+# REQUIRED SECRETS:
+#   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#   AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#
+# REQUIRED VARIABLES:
+#   AZURE_RESOURCE_GROUP
+#   AZURE_APP_SERVICE_NAME
+#   AZURE_APP_SERVICE_SLOT_STAGING
+# =============================================================
+
+name: "⏪ Phase 12 — Production Rollback"
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm-rollback:
+        description: "Type ROLLBACK to confirm you want to swap production back"
+        type: string
+        required: true
+      reason:
+        description: "Reason for rollback (shown in summary)"
+        type: string
+        required: true
+
+jobs:
+  rollback:
+    name: "⏪ Swap Production → Previous Version"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+
+    steps:
+      # ── 1. Confirm rollback input ───────────────────────────
+      - name: Confirm rollback intent
+        run: |
+          if [ "${{ inputs.confirm-rollback }}" != "ROLLBACK" ]; then
+            echo "::error::Rollback not confirmed. Type ROLLBACK in the confirm field."
+            exit 1
+          fi
+          echo "✅ Rollback confirmed by @${{ github.actor }}"
+          echo "📋 Reason: ${{ inputs.reason }}"
+
+      # ── 2. Azure Login ──────────────────────────────────────
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      # ── 3. Show current state before rollback ───────────────
+      - name: Show current slot state
+        run: |
+          echo "🔍 Current slot state before rollback..."
+          echo "────────────────────────────────────────"
+
+          PROD_IMAGE=$(az webapp config container show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --query "DOCKER_CUSTOM_IMAGE_NAME" -o tsv 2>/dev/null || echo "unknown")
+
+          STAGING_IMAGE=$(az webapp config container show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --query "DOCKER_CUSTOM_IMAGE_NAME" -o tsv 2>/dev/null || echo "unknown")
+
+          PROD_URL=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --query defaultHostName -o tsv)
+
+          STAGING_URL=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --query defaultHostName -o tsv)
+
+          echo "Production slot:"
+          echo "  Image : $PROD_IMAGE"
+          echo "  URL   : https://$PROD_URL"
+          echo ""
+          echo "Staging slot (will become new production):"
+          echo "  Image : $STAGING_IMAGE"
+          echo "  URL   : https://$STAGING_URL"
+          echo "────────────────────────────────────────"
+
+          # Save for summary
+          echo "PROD_IMAGE=$PROD_IMAGE"         >> $GITHUB_ENV
+          echo "STAGING_IMAGE=$STAGING_IMAGE"   >> $GITHUB_ENV
+          echo "PROD_URL=https://$PROD_URL"     >> $GITHUB_ENV
+
+      # ── 4. Verify slot-sticky settings before swap ──────────
+      - name: Verify slot-sticky settings
+        run: |
+          RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+          APP="${{ vars.AZURE_APP_SERVICE_NAME }}"
+          STAGING_SLOT="${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}"
+          FAIL=0
+
+          echo "🔍 Verifying slot-sticky settings on both slots..."
+          echo "────────────────────────────────────────"
+
+          REQUIRED_STICKY=(
+            "ASPNETCORE_ENVIRONMENT"
+            "ConnectionStrings__Database"
+            "Secrets__DatabaseConfig"
+            "KeyVault__Uri"
+          )
+
+          echo "── Staging slot ────────────────────────"
+          for SETTING in "${REQUIRED_STICKY[@]}"; do
+            RESULT=$(az webapp config appsettings list \
+              --resource-group "$RG" --name "$APP" --slot "$STAGING_SLOT" \
+              --query "[?name=='$SETTING'] | [0]" -o json)
+            VALUE=$(echo "$RESULT" | jq -r '.value // "NOT FOUND"')
+            STICKY=$(echo "$RESULT" | jq -r '.slotSetting // false')
+            if [ "$VALUE" = "NOT FOUND" ]; then
+              echo "❌ $SETTING — NOT FOUND"
+              FAIL=$((FAIL + 1))
+            elif [ "$STICKY" != "true" ]; then
+              echo "❌ $SETTING = '$VALUE' — NOT slot-sticky"
+              FAIL=$((FAIL + 1))
+            else
+              echo "✅ $SETTING = '$VALUE'"
+            fi
+          done
+
+          echo "── Production slot ─────────────────────"
+          for SETTING in "${REQUIRED_STICKY[@]}"; do
+            RESULT=$(az webapp config appsettings list \
+              --resource-group "$RG" --name "$APP" \
+              --query "[?name=='$SETTING'] | [0]" -o json)
+            VALUE=$(echo "$RESULT" | jq -r '.value // "NOT FOUND"')
+            STICKY=$(echo "$RESULT" | jq -r '.slotSetting // false')
+            if [ "$VALUE" = "NOT FOUND" ]; then
+              echo "❌ $SETTING — NOT FOUND"
+              FAIL=$((FAIL + 1))
+            elif [ "$STICKY" != "true" ]; then
+              echo "❌ $SETTING = '$VALUE' — NOT slot-sticky"
+              FAIL=$((FAIL + 1))
+            else
+              echo "✅ $SETTING = '$VALUE'"
+            fi
+          done
+
+          echo "────────────────────────────────────────"
+
+          if [ $FAIL -ne 0 ]; then
+            echo "::error::$FAIL slot-sticky setting(s) misconfigured — rollback blocked."
+            echo "::error::Fix slot settings before retrying rollback."
+            exit 1
+          fi
+
+          echo "✅ Slot-sticky settings verified — safe to swap back."
+
+      # ── 5. Swap back (the actual rollback) ──────────────────
+      - name: Swap staging → production (rollback)
+        run: |
+          echo "⏪ Swapping staging → production (rollback)..."
+          az webapp deployment slot swap \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
+            --target-slot    production
+          echo "✅ Swap complete."
+
+      # ── 6. Verify production health after rollback ──────────
+      - name: Verify production health post-rollback
+        run: |
+          PROD_URL=$(az webapp show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --query defaultHostName -o tsv)
+
+          echo "Checking production health: https://$PROD_URL/health"
+          echo "────────────────────────────────────────"
+
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://$PROD_URL/health" || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Production is healthy after rollback."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "::error::Production health check failed after rollback!"
+          echo "::error::Manual intervention required — check App Service logs."
+          exit 1
+
+      # ── 7. Summary (always runs) ────────────────────────────
+      - name: Post rollback summary
+        if: always()
+        run: |
+          S="${{ job.status }}"
+          echo "## ⏪ Production Rollback"                              >> $GITHUB_STEP_SUMMARY
+          echo ""                                                        >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |"                                       >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|"                                       >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by  | @${{ github.actor }} |"              >> $GITHUB_STEP_SUMMARY
+          echo "| Reason        | ${{ inputs.reason }} |"              >> $GITHUB_STEP_SUMMARY
+          echo "| Method        | Blue-green swap back |"              >> $GITHUB_STEP_SUMMARY
+          echo "| Removed image | \`${{ env.PROD_IMAGE }}\` |"         >> $GITHUB_STEP_SUMMARY
+          echo "| Restored image| \`${{ env.STAGING_IMAGE }}\` |"      >> $GITHUB_STEP_SUMMARY
+          echo "| Production URL| ${{ env.PROD_URL }} |"               >> $GITHUB_STEP_SUMMARY
+          if [ "$S" = "success" ]; then
+            echo "| Status | ✅ Rollback succeeded |"                  >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status | ❌ Rollback FAILED — manual action needed |" >> $GITHUB_STEP_SUMMARY
+          fi
