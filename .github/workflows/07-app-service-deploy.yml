@@ -119,12 +119,16 @@ jobs:
             exit 1
           fi
 
+          # NOTE: ASPNETCORE_ENVIRONMENT goes under --slot-settings so it stays
+          # pinned to this slot during a swap. Without that, prod would inherit
+          # "Staging" the next time we swap.
           az webapp config appsettings set \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
             --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
-            --settings \
+            --slot-settings \
               ASPNETCORE_ENVIRONMENT=Staging \
+            --settings \
               ASPNETCORE_URLS="http://+:8080" \
               ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
               WEBSITES_PORT=8080 \
@@ -263,6 +267,56 @@ jobs:
               "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
               "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
             }
+
+      # Guard against the prior incident: ASPNETCORE_ENVIRONMENT must be present
+      # AND marked as a slot setting on BOTH slots before we swap. If it isn't
+      # slot-sticky, the swap will carry staging's value into production.
+      - name: Pre-swap verification — ASPNETCORE_ENVIRONMENT slot stickiness
+        run: |
+          set -e
+          RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+          APP="${{ vars.AZURE_APP_SERVICE_NAME }}"
+          STAGING_SLOT="${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}"
+          FAIL=0
+
+          # --- staging slot ---
+          STAGING=$(az webapp config appsettings list \
+            --resource-group "$RG" --name "$APP" --slot "$STAGING_SLOT" \
+            --query "[?name=='ASPNETCORE_ENVIRONMENT'] | [0]" -o json)
+          STAGING_VALUE=$(echo "$STAGING" | jq -r '.value // ""')
+          STAGING_STICKY=$(echo "$STAGING" | jq -r '.slotSetting // false')
+          echo "staging:    value='$STAGING_VALUE' slotSetting=$STAGING_STICKY"
+          if [ "$STAGING_VALUE" != "Staging" ]; then
+            echo "::error::Staging slot ASPNETCORE_ENVIRONMENT='$STAGING_VALUE', expected 'Staging'"
+            FAIL=1
+          fi
+          if [ "$STAGING_STICKY" != "true" ]; then
+            echo "::error::Staging slot ASPNETCORE_ENVIRONMENT is NOT a slot setting — swap would overwrite production."
+            FAIL=1
+          fi
+
+          # --- production slot (no --slot flag = production) ---
+          PROD=$(az webapp config appsettings list \
+            --resource-group "$RG" --name "$APP" \
+            --query "[?name=='ASPNETCORE_ENVIRONMENT'] | [0]" -o json)
+          PROD_VALUE=$(echo "$PROD" | jq -r '.value // ""')
+          PROD_STICKY=$(echo "$PROD" | jq -r '.slotSetting // false')
+          echo "production: value='$PROD_VALUE' slotSetting=$PROD_STICKY"
+          if [ "$PROD_VALUE" != "Production" ]; then
+            echo "::error::Production slot ASPNETCORE_ENVIRONMENT='$PROD_VALUE', expected 'Production'"
+            FAIL=1
+          fi
+          if [ "$PROD_STICKY" != "true" ]; then
+            echo "::error::Production slot ASPNETCORE_ENVIRONMENT is NOT a slot setting — staging's value would carry over on swap."
+            FAIL=1
+          fi
+
+          if [ $FAIL -ne 0 ]; then
+            echo "::error::Pre-swap verification failed. Refusing to swap."
+            echo "::error::Fix with: az webapp config appsettings set -g \$RG -n \$APP [--slot \$SLOT] --slot-settings ASPNETCORE_ENVIRONMENT=<env>"
+            exit 1
+          fi
+          echo "✅ Both slots have ASPNETCORE_ENVIRONMENT correctly configured and slot-sticky."
 
       # Blue-green swap — zero downtime deployment
       # Azure routes all traffic to the staging slot instantly
