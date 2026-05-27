@@ -268,6 +268,14 @@ jobs:
               "tenantId":       "${{ secrets.AZURE_TENANT_ID }}"
             }
 
+      - name: Ensure production slot environment is pinned
+        run: |
+          az webapp config appsettings set \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
+            --slot-settings \
+              ASPNETCORE_ENVIRONMENT=Production
+
       # Guard against the prior incident: ASPNETCORE_ENVIRONMENT must be present
       # AND marked as a slot setting on BOTH slots before we swap. If it isn't
       # slot-sticky, the swap will carry staging's value into production.
