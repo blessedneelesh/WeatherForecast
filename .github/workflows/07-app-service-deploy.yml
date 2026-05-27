@@ -23,6 +23,7 @@
 #   AZURE_APP_SERVICE_SLOT_STAGING → e.g. staging
 #   KEY_VAULT_URI           → e.g. https://my-vault.vault.azure.net/
 #   DB_PASSWORD_SECRET_NAME_STAGING → e.g. weatherforecast-staging-database
+#   DB_PASSWORD_SECRET_NAME_PRODUCTION → e.g. weatherforecast-production-database
 #
 # REQUIRED PERMISSIONS:
 #   Service Principal must have "Contributor" or "Website Contributor"
@@ -128,16 +129,16 @@ jobs:
             --slot           "${{ vars.AZURE_APP_SERVICE_SLOT_STAGING }}" \
             --slot-settings \
               ASPNETCORE_ENVIRONMENT=Staging \
-            --settings \
-              ASPNETCORE_URLS="http://+:8080" \
-              ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
-              WEBSITES_PORT=8080 \
-              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false \
               KeyVault__VaultUri="$KEY_VAULT_URI" \
               KeyVault__DbSecretName="$DB_SECRET_NAME" \
               AZURE_CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}" \
               AZURE_CLIENT_SECRET="${{ secrets.AZURE_CLIENT_SECRET }}" \
-              AZURE_TENANT_ID="${{ secrets.AZURE_TENANT_ID }}"
+              AZURE_TENANT_ID="${{ secrets.AZURE_TENANT_ID }}" \
+            --settings \
+              ASPNETCORE_URLS="http://+:8080" \
+              ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
+              WEBSITES_PORT=8080 \
+              WEBSITES_ENABLE_APP_SERVICE_STORAGE=false
 
       # PDF: "use azure/webapps-deploy to deploy your application
       #       to Azure App Service"
@@ -270,11 +271,24 @@ jobs:
 
       - name: Ensure production slot environment is pinned
         run: |
+          KEY_VAULT_URI="${{ vars.KEY_VAULT_URI }}"
+          DB_SECRET_NAME="${{ vars.DB_PASSWORD_SECRET_NAME_PRODUCTION || 'weatherforecast-production-database' }}"
+
+          if [ -z "$KEY_VAULT_URI" ]; then
+            echo "::error::Missing repository/environment variable KEY_VAULT_URI."
+            exit 1
+          fi
+
           az webapp config appsettings set \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --name           "${{ vars.AZURE_APP_SERVICE_NAME }}" \
             --slot-settings \
-              ASPNETCORE_ENVIRONMENT=Production
+              ASPNETCORE_ENVIRONMENT=Production \
+              KeyVault__VaultUri="$KEY_VAULT_URI" \
+              KeyVault__DbSecretName="$DB_SECRET_NAME" \
+              AZURE_CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}" \
+              AZURE_CLIENT_SECRET="${{ secrets.AZURE_CLIENT_SECRET }}" \
+              AZURE_TENANT_ID="${{ secrets.AZURE_TENANT_ID }}"
 
       # Guard against the prior incident: ASPNETCORE_ENVIRONMENT must be present
       # AND marked as a slot setting on BOTH slots before we swap. If it isn't
