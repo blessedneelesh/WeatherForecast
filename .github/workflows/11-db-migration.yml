@@ -124,7 +124,7 @@ jobs:
           echo "▶ Migrating [${{ inputs.environment }}] → ${{ vars.PG_HOST }}/$DB"
           echo "────────────────────────────────────────"
 
-          for script in $(ls migrations/*.sql | sort); do
+          for script in $(find migrations -maxdepth 1 -type f -name '*.sql' ! -iname '*rollback*.sql' | sort); do
             echo "→ Applying: $script"
             psql \
               --host="${{ vars.PG_HOST }}" \
