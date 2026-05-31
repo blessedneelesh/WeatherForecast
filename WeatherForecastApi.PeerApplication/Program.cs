@@ -64,7 +64,7 @@ builder.Services.AddWeatherForecastServices();
 builder.Services.AddControllers()
     .AddApplicationPart(typeof(WeatherForecastApi.Peer.Controllers.WeatherForecastsController).Assembly);
 
-if (builder.Environment.IsDevelopment())
+if (builder.Environment.IsDevelopment() || builder.Environment.IsStaging() || builder.Environment.IsProduction())
 {
     var allowedOrigins = builder.Configuration
         .GetSection("Cors:AllowedOrigins")
@@ -109,7 +109,7 @@ app.UseMiddleware<WeatherForecastNotFoundExceptionMiddleware>();
 
 app.UseHttpsRedirection();
 
-if (app.Environment.IsDevelopment())
+if (app.Environment.IsDevelopment() || app.Environment.IsStaging() || app.Environment.IsProduction())
 {
     app.UseCors();
 }
