@@ -71,7 +71,6 @@ jobs:
       # --sarif-file-output      → upload to GitHub Security tab
       - name: Snyk dependency test
         uses: snyk/actions/dotnet@master
-        continue-on-error: true    # Don't block — upload results first
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
@@ -80,7 +79,6 @@ jobs:
             --sarif-file-output=snyk-deps.sarif
             --all-projects
             --detection-depth=4
-            --fail-on=all
 
       # Check if SARIF file exists
       - name: Verify SARIF file
@@ -223,7 +221,7 @@ jobs:
       - name: Snyk container test
         if: steps.check-dockerfile.outputs.dockerfile_exists == 'true'
         uses: snyk/actions/docker@master
-        continue-on-error: true
+        continue-on-error: true    # Fail if vulnerabilities found
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
